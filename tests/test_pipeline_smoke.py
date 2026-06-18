@@ -81,6 +81,17 @@ def write_image_ids(tokens_dir: Path, *, relative_only: bool, with_files: bool) 
 
 def test_cli_smoke_cache_only_pipeline(tmp_path: Path):
     write_cache(tmp_path)
+    stats_cfg = tmp_path / "stats.yaml"
+    stats_cfg.write_text(
+        """
+run:
+  out_dir: out/stats
+tokens:
+  cache_dir: tokens
+  stats_dir: out/stats
+""",
+        encoding="utf-8",
+    )
     train_cfg = tmp_path / "train.yaml"
     train_cfg.write_text(
         """
@@ -88,17 +99,24 @@ run:
   out_dir: out/train
 tokens:
   cache_dir: tokens
+  stats_dir: out/stats
 sae:
   variant: batchtopk
   d_model: 8
   d_sae: 16
   target_k: 2
+  aux_k: 2
+  dead_steps_threshold: 1
+  aux_loss_weight: 0.05
 train:
   device: cpu
   precision: fp32
   batch_size: 4
   epochs: 1
   num_workers: 0
+  backend: torch_sparse
+  normalize_inputs: true
+  warmup_steps: 1
 """,
         encoding="utf-8",
     )
@@ -116,8 +134,11 @@ build_h:
   precision: fp32
   image_batch_size: 2
   token_batch_size: 8
+  max_images: 2
 inspect:
   device: cpu
+  candidate_score_mode: max
+  miners: [localized, broad]
   preview_concepts: 2
   preview_images_per_concept: 2
   min_support: 1
@@ -130,12 +151,16 @@ inspect:
     try:
         import os
         os.chdir(tmp_path)
+        assert main(["compute-token-stats", "--config", str(stats_cfg)]) == 0
         assert main(["train-sae", "--config", str(train_cfg)]) == 0
         assert main(["build-h", "--config", str(build_cfg)]) == 0
         assert main(["inspect", "--config", str(build_cfg)]) == 0
     finally:
         os.chdir(cwd)
     assert (tmp_path / "out" / "h" / "H_mean.npy").exists()
+    assert (tmp_path / "out" / "h" / "H_max_top_indices.npy").exists()
+    assert (tmp_path / "out" / "h" / "h_image_rows.npy").exists()
+    assert (tmp_path / "out" / "h" / "feature_top_tokens.npz").exists()
     assert (tmp_path / "out" / "h" / "qc_summary.json").exists()
 
 

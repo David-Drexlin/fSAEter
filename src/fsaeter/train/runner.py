@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import time
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from fsaeter.backends import TorchDenseBackend, TritonSparseBackend
+from fsaeter.backends import TorchDenseBackend, TorchSparseBackend, TritonSparseBackend
 from fsaeter.config_compat import normalize_train_config
 from fsaeter.data.cache import resolve_token_cache_info
 from fsaeter.data.datasets import PatchTokenMemmapDataset, split_image_rows
@@ -22,6 +24,7 @@ from fsaeter.models.local_sae import (
     build_local_sae,
     save_local_sae_checkpoint,
 )
+from fsaeter.train.stats import load_activation_stats
 from fsaeter.utils.config import resolve_path, save_yaml_config
 from fsaeter.utils.distributed import (
     barrier,
@@ -57,6 +60,8 @@ def build_backend(name: str):
     normalized = str(name).lower()
     if normalized == "torch_dense":
         return TorchDenseBackend()
+    if normalized == "torch_sparse":
+        return TorchSparseBackend()
     if normalized == "triton_sparse":
         return TritonSparseBackend()
     raise ValueError(f"Unknown backend {name!r}")
@@ -68,6 +73,102 @@ def _unwrap_model(model: torch.nn.Module):
     return model
 
 
+def build_optimizer(model: torch.nn.Module, train_cfg: dict) -> torch.optim.Optimizer:
+    base_model = _unwrap_model(model)
+    decay_params = []
+    no_decay_params = []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in {"b_enc", "b_dec"} or name.endswith("bias"):
+            no_decay_params.append(param)
+        elif name == "W_dec" and base_model.decoder_row_norm:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    return torch.optim.AdamW(
+        [
+            {
+                "params": decay_params,
+                "weight_decay": float(train_cfg.get("weight_decay", 1e-4)),
+            },
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=float(train_cfg.get("lr", 3e-4)),
+        betas=(float(train_cfg.get("beta1", 0.9)), float(train_cfg.get("beta2", 0.95))),
+    )
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    train_cfg: dict,
+) -> torch.optim.lr_scheduler.LambdaLR | None:
+    if total_steps <= 0:
+        return None
+    warmup_steps = max(0, int(train_cfg.get("warmup_steps", 0)))
+    decay = str(train_cfg.get("lr_decay", "cosine")).lower()
+    min_lr_fraction = float(train_cfg.get("min_lr_fraction", 0.1))
+
+    def lr_lambda(step: int) -> float:
+        step = max(0, int(step))
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        if decay in {"none", "constant"}:
+            return 1.0
+        progress = 0.0
+        if total_steps > warmup_steps:
+            progress = min(
+                1.0,
+                max(0.0, float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))),
+            )
+        if decay == "linear":
+            return max(min_lr_fraction, 1.0 - (1.0 - min_lr_fraction) * progress)
+        if decay == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_fraction + (1.0 - min_lr_fraction) * cosine
+        raise ValueError(f"Unsupported lr_decay {decay!r}")
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def capture_rng_state() -> dict:
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def restore_rng_state(state: dict | None) -> None:
+    if not state:
+        return
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+
+
+def load_training_stats_into_model(model: torch.nn.Module, config: dict, *, base_root: Path) -> Path | None:
+    base_model = _unwrap_model(model)
+    tokens_cfg = dict(config.get("tokens") or {})
+    stats_dir_value = tokens_cfg.get("stats_dir")
+    if not stats_dir_value:
+        return None
+    stats_dir = resolve_path(stats_dir_value, base=base_root)
+    stats = load_activation_stats(stats_dir)
+    base_model.load_activation_stats_(mean=stats["mean"], scale=stats["scale"])
+    if bool(dict(config.get("train") or {}).get("init_decoder_bias_from_stats", True)):
+        base_model.initialize_decoder_bias_from_stats_()
+    return stats_dir
+
+
 def run_epoch(
     *,
     model: torch.nn.Module,
@@ -76,39 +177,62 @@ def run_epoch(
     device: torch.device,
     precision: str,
     optimizer: torch.optim.Optimizer | None,
+    scheduler: torch.optim.lr_scheduler.LambdaLR | None,
+    scaler,
     grad_clip_norm: float | None,
-) -> tuple[dict, np.ndarray]:
+    global_step: int,
+) -> tuple[dict, np.ndarray, int]:
     is_train = optimizer is not None
     base_model = _unwrap_model(model)
     stats = RunningFeatureStats(d_sae=int(base_model.d_sae))
+    current_step = int(global_step)
+
     for batch in loader:
         x = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
         if is_train:
             optimizer.zero_grad(set_to_none=True)
+            current_step += 1
+        step_for_batch = current_step if is_train else None
+
         with torch.set_grad_enabled(is_train):
             with autocast_context(device, precision):
-                outputs = backend.forward_loss(model, x)
+                outputs = backend.forward_loss(
+                    model,
+                    x,
+                    global_step=step_for_batch,
+                    update_state=is_train,
+                )
             for key in ("loss", "recon_mse", "aux_loss"):
                 value = outputs[key]
                 if torch.is_tensor(value) and value.ndim > 0:
                     outputs[key] = value.mean()
             loss = outputs["loss"]
             if is_train:
-                loss.backward()
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                if base_model.decoder_row_norm:
+                    base_model.project_decoder_grad_()
                 if grad_clip_norm is not None and grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm))
-                optimizer.step()
-                if (
-                    hasattr(base_model, "normalize_decoder_rows_")
-                    and base_model.decoder_row_norm
-                ):
+                if scaler is not None and scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                if base_model.decoder_row_norm:
                     base_model.normalize_decoder_rows_()
+
         stats.update(
             batch_size=int(x.shape[0]),
             loss=outputs["loss"].detach(),
             recon_mse=outputs["recon_mse"].detach(),
             aux_loss=outputs["aux_loss"].detach(),
-            features=outputs["features"].detach(),
+            features=outputs["features"],
         )
 
     reduced_summary, feature_frequency = stats.reduced_summary(device=device)
@@ -119,7 +243,7 @@ def run_epoch(
         "mean_l0": float(reduced_summary.mean_l0),
         "max_l0": int(reduced_summary.max_l0),
         "dead_fraction": float(reduced_summary.dead_fraction),
-    }, feature_frequency
+    }, feature_frequency, current_step
 
 
 def run_training(config: dict, *, base_root: Path) -> dict:
@@ -144,10 +268,15 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     sae_cfg.setdefault("d_model", int(token_info.d_model))
     if int(sae_cfg["d_model"]) != int(token_info.d_model):
         raise ValueError(
-            f"Config d_model={sae_cfg['d_model']} does not match token dim "
-            f"{token_info.d_model}"
+            f"Config d_model={sae_cfg['d_model']} does not match token dim {token_info.d_model}"
         )
     config["sae"] = sae_cfg
+    train_cfg.setdefault("backend", "torch_sparse")
+    train_cfg.setdefault("normalize_inputs", True)
+    train_cfg.setdefault("init_decoder_bias_from_stats", True)
+    train_cfg.setdefault("lr_decay", "cosine")
+    train_cfg.setdefault("min_lr_fraction", 0.1)
+    config["train"] = train_cfg
 
     train_rows, val_rows = split_image_rows(
         token_info.num_images,
@@ -225,26 +354,59 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     )
 
     model = build_local_sae(config).to(device)
+    stats_dir = load_training_stats_into_model(model, config, base_root=base_root)
     if bool(train_cfg.get("compile", False)) and hasattr(torch, "compile") and not is_distributed():
         model = torch.compile(model)  # type: ignore[assignment]
     if is_distributed():
         model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
 
-    optimizer = torch.optim.AdamW(
-        _unwrap_model(model).parameters(),
-        lr=float(train_cfg.get("lr", 3e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
-        betas=(float(train_cfg.get("beta1", 0.9)), float(train_cfg.get("beta2", 0.95))),
+    optimizer = build_optimizer(model, train_cfg)
+    total_steps = epochs * max(1, len(train_loader))
+    scheduler = build_scheduler(optimizer, total_steps=total_steps, train_cfg=train_cfg)
+    scaler = (
+        torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and precision_is_fp16(train_cfg))
+        if hasattr(torch.cuda, "amp")
+        else None
     )
-    backend = build_backend(train_cfg.get("backend", "torch_dense"))
+    backend = build_backend(train_cfg.get("backend", "torch_sparse"))
     precision = str(train_cfg.get("precision", "fp32"))
 
     history: list[dict] = []
     best_val_loss: float | None = None
     best_epoch = -1
     metrics_jsonl = out_dir / "epoch_metrics.jsonl"
+    start_epoch = 1
+    global_step = 0
+    resume_from = train_cfg.get("resume_from")
+    if resume_from:
+        resume_path = resolve_path(resume_from, base=base_root)
+        payload = torch.load(resume_path, map_location=device)
+        _unwrap_model(model).load_state_dict(payload["state_dict"])
+        if payload.get("optimizer") is not None:
+            optimizer.load_state_dict(payload["optimizer"])
+        if scheduler is not None and payload.get("scheduler") is not None:
+            scheduler.load_state_dict(payload["scheduler"])
+        if scaler is not None and payload.get("scaler") is not None:
+            scaler.load_state_dict(payload["scaler"])
+        restore_rng_state(payload.get("rng"))
+        history = list(payload.get("history") or [])
+        best_val_loss = payload.get("best_val_loss")
+        start_epoch = int(payload.get("epoch", 0)) + 1
+        global_step = int(payload.get("step", 0))
 
-    for epoch in range(1, epochs + 1):
+    if is_main_process():
+        summary_seed = {
+            "seed": int(seed),
+            "backend": str(backend.name),
+            "stats_dir": None if stats_dir is None else str(stats_dir),
+            "resume_from": None if not resume_from else str(resolve_path(resume_from, base=base_root)),
+        }
+        (out_dir / "run_context.json").write_text(
+            json.dumps(summary_seed, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    for epoch in range(start_epoch, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if val_sampler is not None:
@@ -252,39 +414,48 @@ def run_training(config: dict, *, base_root: Path) -> dict:
 
         epoch_start = time.time()
         model.train()
-        train_metrics, train_feature_freq = run_epoch(
+        train_metrics, train_feature_freq, global_step = run_epoch(
             model=model,
             backend=backend,
             loader=train_loader,
             device=device,
             precision=precision,
             optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
             grad_clip_norm=grad_clip_norm,
+            global_step=global_step,
         )
 
         model.eval()
         if len(val_set) > 0:
-            val_metrics, val_feature_freq = run_epoch(
+            val_metrics, val_feature_freq, _ = run_epoch(
                 model=model,
                 backend=backend,
                 loader=val_loader,
                 device=device,
                 precision=precision,
                 optimizer=None,
+                scheduler=None,
+                scaler=None,
                 grad_clip_norm=None,
+                global_step=global_step,
             )
         else:
             val_metrics = {
-                k: float("nan")
-                for k in ("loss", "recon_mse", "aux_loss", "mean_l0", "dead_fraction")
+                key: float("nan")
+                for key in ("loss", "recon_mse", "aux_loss", "mean_l0", "dead_fraction")
             }
             val_metrics["max_l0"] = 0
             val_feature_freq = np.zeros((int(_unwrap_model(model).d_sae),), dtype=np.float32)
 
         epoch_seconds = float(time.time() - epoch_start)
+        current_lr = float(optimizer.param_groups[0]["lr"])
         record = {
             "epoch": epoch,
+            "global_step": int(global_step),
             "epoch_seconds": epoch_seconds,
+            "lr": current_lr,
             "train_rows_per_second": float(len(train_set) / max(epoch_seconds, 1e-6)),
             "train": train_metrics,
             "val": val_metrics,
@@ -305,19 +476,29 @@ def run_training(config: dict, *, base_root: Path) -> dict:
 
             checkpoints_dir = out_dir / "checkpoints"
             base_model = _unwrap_model(model)
+            ckpt_kwargs = {
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": None if scheduler is None else scheduler.state_dict(),
+                "scaler_state": (
+                    None if scaler is None or not scaler.is_enabled() else scaler.state_dict()
+                ),
+                "rng_state": capture_rng_state(),
+            }
             save_local_sae_checkpoint(
                 checkpoints_dir / f"ep-{epoch:07d}.pt",
                 model=base_model,
                 config=config,
                 epoch=epoch,
-                step=epoch * len(train_loader),
+                step=global_step,
                 best_val_loss=best_val_loss,
                 history=history,
+                **ckpt_kwargs,
             )
-            if not np.isnan(val_metrics["loss"]):
-                current_val = float(val_metrics["loss"])
-            else:
-                current_val = float(train_metrics["loss"])
+            current_val = (
+                float(val_metrics["loss"])
+                if not np.isnan(val_metrics["loss"])
+                else float(train_metrics["loss"])
+            )
             if best_val_loss is None or current_val < best_val_loss:
                 best_val_loss = current_val
                 best_epoch = epoch
@@ -326,34 +507,46 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                     model=base_model,
                     config=config,
                     epoch=epoch,
-                    step=epoch * len(train_loader),
+                    step=global_step,
                     best_val_loss=best_val_loss,
                     history=history,
+                    **ckpt_kwargs,
                 )
+            (out_dir / "history.json").write_text(
+                json.dumps(history, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            train_summary = {
+                "out_dir": str(out_dir),
+                "backend": str(backend.name),
+                "epochs": int(epochs),
+                "completed_epochs": int(epoch),
+                "global_step": int(global_step),
+                "seed": int(seed),
+                "stats_dir": None if stats_dir is None else str(stats_dir),
+                "best_epoch": int(best_epoch),
+                "best_val_loss": None if best_val_loss is None else float(best_val_loss),
+                "last_train": train_metrics,
+                "last_val": val_metrics,
+                "lr": current_lr,
+            }
+            (out_dir / "train_summary.json").write_text(
+                json.dumps(train_summary, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
         barrier()
 
-    summary = {
-        "run_name": run_cfg.get("name"),
-        "tokens_dir": str(tokens_dir),
+    result = {
         "out_dir": str(out_dir),
-        "best_epoch": int(best_epoch),
-        "best_val_loss": None if best_val_loss is None else float(best_val_loss),
-        "num_epochs": int(epochs),
-        "variant": str(sae_cfg.get("variant", "batchtopk")),
-        "d_model": int(sae_cfg["d_model"]),
-        "d_sae": int(sae_cfg["d_sae"]),
-        "target_k": int(sae_cfg["target_k"]),
-        "train_rows": int(len(train_set)),
-        "val_rows": int(len(val_set)),
-        "epoch_metrics_jsonl": str(metrics_jsonl),
-        "best_checkpoint": str(out_dir / "checkpoints" / "best.pt"),
-        "world_size": int(world_size()),
-        "backend": backend.name,
+        "epochs": int(epochs),
+        "completed_epochs": int(max(0, epochs - start_epoch + 1)),
+        "global_step": int(global_step),
+        "backend": str(backend.name),
+        "stats_dir": None if stats_dir is None else str(stats_dir),
     }
-    if is_main_process():
-        with (out_dir / "history.json").open("w", encoding="utf-8") as handle:
-            json.dump(history, handle, indent=2, sort_keys=True)
-        with (out_dir / "train_summary.json").open("w", encoding="utf-8") as handle:
-            json.dump(summary, handle, indent=2, sort_keys=True)
     cleanup_distributed()
-    return summary
+    return result
+
+
+def precision_is_fp16(train_cfg: dict) -> bool:
+    return str(train_cfg.get("precision", "fp32")).lower() == "fp16"

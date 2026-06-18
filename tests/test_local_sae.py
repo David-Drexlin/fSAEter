@@ -91,6 +91,17 @@ def test_matryoshka_prefixes_are_monotonic():
     assert model.matryoshka_prefixes == (4, 8, 16)
 
 
+def test_invalid_matryoshka_prefixes_are_rejected():
+    with pytest.raises(ValueError):
+        LocalSparseAutoencoder(
+            d_model=4,
+            d_sae=16,
+            target_k=4,
+            variant="matryoshka_batchtopk",
+            matryoshka_prefixes=[8, 4, 16],
+        )
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))

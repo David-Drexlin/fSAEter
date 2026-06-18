@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from fsaeter.inspect.basic_qc import (
+    select_localized_concepts,
     select_broad_concepts,
     select_sparse_topk_rows,
     tuple_uniqueness_rates,
@@ -49,3 +50,24 @@ def test_select_broad_concepts_rejects_class_collapsed_feature():
     assert 0 not in candidate_ids
     assert 1 not in candidate_ids
     assert 2 in candidate_ids
+
+
+def test_select_localized_concepts_prefers_sparse_high_peak_features():
+    top_indices = np.asarray(
+        [[0, 1, -1], [0, -1, -1], [2, -1, -1], [2, -1, -1]],
+        dtype=np.int64,
+    )
+    top_values = np.asarray(
+        [[3.0, 0.5, 0.0], [2.5, 0.0, 0.0], [4.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    candidates = select_localized_concepts(
+        top_indices,
+        top_values,
+        vocab_size=3,
+        image_frequency_max=np.asarray([0.5, 0.75, 0.5], dtype=np.float32),
+        max_activation=np.asarray([3.0, 0.5, 4.5], dtype=np.float32),
+        min_support=1,
+        top_n=3,
+    )
+    assert candidates[0]["concept_id"] == 2

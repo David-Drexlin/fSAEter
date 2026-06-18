@@ -74,6 +74,12 @@ def normalize_train_config(config: dict) -> dict:
             "max_train_rows",
             "max_val_rows",
             "compile",
+            "normalize_inputs",
+            "init_decoder_bias_from_stats",
+            "warmup_steps",
+            "lr_decay",
+            "min_lr_fraction",
+            "resume_from",
         ):
             if key in legacy_training and key not in train:
                 train[key] = legacy_training[key]
@@ -82,6 +88,9 @@ def normalize_train_config(config: dict) -> dict:
         sae["matryoshka_prefixes"] = legacy_matry["prefixes"]
     if "weights" in legacy_matry and "matryoshka_weights" not in sae:
         sae["matryoshka_weights"] = legacy_matry["weights"]
+    for key in ("aux_k", "dead_steps_threshold", "aux_loss_weight"):
+        if key in legacy_training and key not in sae:
+            sae[key] = legacy_training[key]
 
     return {
         "run": run,
@@ -107,7 +116,17 @@ def normalize_build_h_config(config: dict) -> dict:
     for key in ("device", "precision", "image_batch_size", "token_batch_size", "max_images"):
         if key in inference and key not in build_h:
             build_h[key] = inference[key]
-    for key in ("image_top_k", "active_threshold", "save_max", "save_dtype"):
+    for key in (
+        "image_top_k",
+        "active_threshold",
+        "save_max",
+        "save_dtype",
+        "save_dense_mean",
+        "save_dense_max",
+        "save_topk_mean",
+        "save_topk_max",
+        "save_sparse_csr",
+    ):
         if key in pooling and key not in build_h:
             build_h[key] = pooling[key]
     for key, value in qc.items():

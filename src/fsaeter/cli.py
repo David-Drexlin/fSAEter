@@ -29,6 +29,7 @@ from fsaeter.data.imagefolder import (
 from fsaeter.h.build import run_build_h
 from fsaeter.inspect.basic_qc import run_basic_qc
 from fsaeter.train.runner import run_training
+from fsaeter.train.stats import compute_token_stats
 from fsaeter.utils.config import (
     load_yaml_config,
     resolve_path,
@@ -113,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_mine.add_argument("--device", default=None)
     p_mine.add_argument("--dry-run", action="store_true")
 
+    p_stats = sub.add_parser(
+        "compute-token-stats",
+        help="Compute activation statistics for normalized SAE training.",
+    )
+    p_stats.add_argument("--config", required=True)
+    p_stats.add_argument("--tokens", default=None)
+    p_stats.add_argument("--out", default=None)
+    p_stats.add_argument("--dry-run", action="store_true")
+
     return parser
 
 
@@ -157,6 +167,18 @@ def _apply_train_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["train"]["device"] = args.device
     if args.epochs is not None:
         config["train"]["epochs"] = int(args.epochs)
+    return config
+
+
+def _apply_stats_overrides(config: dict, args: argparse.Namespace) -> dict:
+    config = normalize_train_config(config)
+    config.setdefault("run", {})
+    config.setdefault("tokens", {})
+    if args.tokens is not None:
+        config["tokens"]["cache_dir"] = args.tokens
+    if args.out is not None:
+        config["tokens"]["stats_dir"] = args.out
+        config["run"]["out_dir"] = args.out
     return config
 
 
@@ -331,12 +353,14 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
         device=device,
         precision=str(inspect_cfg.get("precision", "fp32")),
         preview_score_mode=str(inspect_cfg.get("preview_score_mode", "max")),
+        candidate_score_mode=str(inspect_cfg.get("candidate_score_mode", "max")),
         preview_concepts=int(inspect_cfg.get("preview_concepts", 12)),
         preview_images_per_concept=int(inspect_cfg.get("preview_images_per_concept", 12)),
         min_support=int(inspect_cfg.get("min_support", 64)),
         min_class_coverage=int(inspect_cfg.get("min_class_coverage", 8)),
         min_per_class=int(inspect_cfg.get("min_per_class", 4)),
         top_candidate_count=int(inspect_cfg.get("top_candidate_count", 50)),
+        miners=inspect_cfg.get("miners", ["localized", "broad"]),
         data_root=data_root,
     )
     return {"concept_dir": str(concept_dir), "qc": qc}
@@ -381,6 +405,23 @@ def preview_build_command(config: dict, *, base_root: Path) -> dict:
     }
 
 
+def preview_stats_command(config: dict, *, base_root: Path) -> dict:
+    config = normalize_train_config(config)
+    tokens_dir = resolve_path(config["tokens"]["cache_dir"], base=base_root)
+    out_dir = resolve_path(
+        config["tokens"].get("stats_dir", config.get("run", {}).get("out_dir", "outputs/token_stats")),
+        base=base_root,
+    )
+    token_info = resolve_token_cache_info(tokens_dir)
+    return {
+        "tokens_dir": str(tokens_dir),
+        "stats_dir": str(out_dir),
+        "num_images": int(token_info.num_images),
+        "tokens_per_image": int(token_info.tokens_per_image),
+        "d_model": int(token_info.d_model),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -400,6 +441,12 @@ def main(argv: list[str] | None = None) -> int:
             payload = preview_train_command(normalized, base_root=base_root)
         else:
             payload = run_training(normalized, base_root=base_root)
+    elif args.command == "compute-token-stats":
+        normalized = _apply_stats_overrides(config, args)
+        if args.dry_run:
+            payload = preview_stats_command(normalized, base_root=base_root)
+        else:
+            payload = compute_token_stats(normalized, base_root=base_root)
     elif args.command == "build-h":
         normalized = _apply_build_overrides(config, args)
         if args.dry_run:

@@ -5,29 +5,37 @@ run:
 
 tokens:
   cache_dir: outputs/in100_dinov2b_reg_tokens_10k/tokens
+  stats_dir: outputs/in100_dinov2b_reg_tokens_10k/stats
 
 sae:
   variant: batchtopk
   d_model: 768
   d_sae: 32768
   target_k: 16
+  aux_k: 32
+  dead_steps_threshold: 1000
+  aux_loss_weight: 0.03125
   decoder_row_norm: true
   matryoshka_prefixes: []
   matryoshka_weights: []
 
 train:
-  backend: torch_dense
+  backend: torch_sparse
   device: auto
   precision: bf16
   batch_size: 2048
   epochs: 2
+  normalize_inputs: true
+  init_decoder_bias_from_stats: true
   lr: 0.0003
   weight_decay: 0.0001
   beta1: 0.9
   beta2: 0.95
+  warmup_steps: 100
+  lr_decay: cosine
+  min_lr_fraction: 0.1
   grad_clip_norm: 1.0
   val_fraction: 0.1
   split_seed: 0
   num_workers: 8
   compile: false
-

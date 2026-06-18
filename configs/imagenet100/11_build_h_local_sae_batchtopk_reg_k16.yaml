@@ -15,12 +15,18 @@ build_h:
   token_batch_size: 4096
   image_top_k: 64
   active_threshold: 1.0e-06
-  save_max: true
+  save_dense_mean: true
+  save_dense_max: true
+  save_topk_mean: true
+  save_topk_max: true
+  save_sparse_csr: false
   save_dtype: float16
 
 inspect:
   device: auto
   precision: fp32
+  candidate_score_mode: max
+  miners: [localized, broad]
   min_support: 32
   min_class_coverage: 6
   min_per_class: 2
@@ -28,4 +34,3 @@ inspect:
   preview_concepts: 10
   preview_images_per_concept: 8
   preview_score_mode: max
-
