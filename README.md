@@ -6,6 +6,7 @@
 - train local sparse autoencoders over patch-token memmaps
 - build image-level concept matrices `H_mean`, `H_max`, `H_top_indices`, and `H_top_values`
 - inspect learned features with lightweight statistics, previews, and candidate ranking
+- compute token statistics for normalized SAE training and resumable runs
 
 It intentionally does **not** include:
 
@@ -27,9 +28,11 @@ images
 
 The package ships with:
 
-- a plain PyTorch training backend
+- `torch_dense` for dense parity/debugging
+- `torch_sparse` as the default sparse post-TopK training backend
+- `triton_sparse` as an experimental CUDA sparse-decode backend
 - a DDP-ready runner
-- a documented backend seam for future Triton / sparse-kernel work
+- normalized-input training, aux-k dead-feature support, resumeable checkpoints, and build-time inference-mode controls
 - preset-driven backbone loading (`dinov2`, `dinov3`, `siglip2`, `clip`, `uni2`) plus raw factory-string override
 
 ## Quickstart
@@ -56,7 +59,13 @@ you can skip extraction entirely and use only `train-sae`, `build-h`, and `mine-
 fsaeter extract-tokens --config configs/imagenet100/00_extract_tokens_dinov2b_reg_10k.yaml
 ```
 
-### 2. Train a local BatchTopK SAE
+### 2. Compute token stats for normalized training
+
+```bash
+fsaeter compute-token-stats --config configs/imagenet100/10_train_local_sae_batchtopk_reg_k16.yaml
+```
+
+### 3. Train a local BatchTopK SAE
 
 ```bash
 fsaeter train-sae --config configs/imagenet100/10_train_local_sae_batchtopk_reg_k16.yaml
@@ -69,13 +78,18 @@ torchrun --standalone --nproc_per_node=2 -m fsaeter.cli train-sae \
   --config configs/imagenet100/10_train_local_sae_batchtopk_reg_k16.yaml
 ```
 
-### 3. Build `H`
+### 4. Build `H`
 
 ```bash
 fsaeter build-h --config configs/imagenet100/11_build_h_local_sae_batchtopk_reg_k16.yaml
 ```
 
-### 4. Mine candidate concepts and previews
+New `build-h` runs default to `build_h.inference_mode: per_row_topk`, which makes
+concept activations invariant to image/token chunking during `H` construction and QC.
+Legacy concept directories without a recorded mode are interpreted as
+`batchtopk_train_style` for exact historical reproduction.
+
+### 5. Mine candidate concepts and previews
 
 ```bash
 fsaeter mine-concepts --config configs/imagenet100/11_build_h_local_sae_batchtopk_reg_k16.yaml
@@ -83,9 +97,19 @@ fsaeter mine-concepts --config configs/imagenet100/11_build_h_local_sae_batchtop
 
 ## Backend status
 
-- default: plain PyTorch dense compute
-- supported multi-GPU mode: `torchrun` / DDP
-- future path: Triton / sparse kernels behind `fsaeter.train.backends`
+| Backend | Status | Sparse after TopK | Triton | Recommended use |
+| --- | --- | --- | --- | --- |
+| `torch_dense` | stable | no | no | parity/debug |
+| `torch_sparse` | default | yes | no | main small/medium runs |
+| `triton_sparse` | experimental | yes | forward sparse decode | CUDA benchmarking and parity checks |
+
+Other runtime features now in-tree:
+
+- normalized training via `compute-token-stats` + `tokens.stats_dir`
+- aux-k dead-feature loss support
+- decoder-gradient projection and decoder row renormalization
+- optimizer/scheduler/scaler/RNG checkpoint resume
+- `build_h.inference_mode` to separate deterministic per-row inference from legacy BatchTopK evaluation semantics
 
 ## References
 

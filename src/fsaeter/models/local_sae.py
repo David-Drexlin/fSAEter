@@ -538,7 +538,7 @@ def load_local_sae_checkpoint(
             UserWarning,
             stacklevel=2,
         )
-        payload = torch.load(path, map_location=device)
+        payload = torch.load(path, map_location=device, weights_only=False)
     config = dict(payload.get("config") or {})
     model = build_local_sae(config).to(device)
     model.load_state_dict(payload["state_dict"])

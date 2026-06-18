@@ -8,8 +8,59 @@ import numpy as np
 import torch
 from torch import Tensor
 
+SUPPORTED_INFERENCE_MODES = ("per_row_topk", "batchtopk_train_style")
 
-def encode_sae(model: torch.nn.Module, x: Tensor) -> Tensor:
+
+def normalize_inference_mode(
+    inference_mode: str | None,
+    *,
+    default: str,
+) -> str:
+    normalized = default if inference_mode is None else str(inference_mode).strip().lower()
+    if normalized not in SUPPORTED_INFERENCE_MODES:
+        raise ValueError(
+            f"Unsupported inference_mode {normalized!r}; expected one of {SUPPORTED_INFERENCE_MODES}"
+        )
+    return normalized
+
+
+def per_row_topk_nonnegative(positive_acts: Tensor, target_k: int) -> Tensor:
+    if positive_acts.ndim != 2:
+        raise ValueError(f"Expected [B,F] activations, got {positive_acts.shape}")
+    batch, features = positive_acts.shape
+    if batch <= 0 or features <= 0:
+        return torch.zeros_like(positive_acts)
+    row_k = min(max(0, int(target_k)), int(features))
+    if row_k <= 0:
+        return torch.zeros_like(positive_acts)
+    values, indices = torch.topk(positive_acts, k=row_k, dim=1, sorted=False)
+    values = torch.where(values > 0, values, torch.zeros_like(values))
+    dense = torch.zeros_like(positive_acts)
+    dense.scatter_(1, indices, values)
+    return dense
+
+
+def encode_sae(
+    model: torch.nn.Module,
+    x: Tensor,
+    *,
+    inference_mode: str | None = None,
+) -> Tensor:
+    if inference_mode is not None:
+        normalized_mode = normalize_inference_mode(
+            inference_mode,
+            default="batchtopk_train_style",
+        )
+        if not hasattr(model, "prepare_target") or not hasattr(model, "preactivate_target"):
+            raise TypeError(
+                f"Model type {type(model).__name__} does not expose the local SAE inference surface"
+            )
+        target = model.prepare_target(x)
+        h_x = model.preactivate_target(target)
+        positive = torch.relu(h_x)
+        if normalized_mode == "per_row_topk":
+            return per_row_topk_nonnegative(positive, int(model.target_k))
+        return model._batch_topk_nonnegative(positive, int(model.target_k))
     if hasattr(model, "encode"):
         encoded = model.encode(x)
         if hasattr(encoded, "f_x"):
@@ -44,6 +95,7 @@ def pool_sae_image_batch(
     token_batch_size: int = 512,
     precision: str = "fp32",
     active_threshold: float = 0.0,
+    inference_mode: str = "batchtopk_train_style",
 ) -> tuple[Tensor, Tensor, Tensor]:
     if tokens.ndim != 3:
         raise ValueError(f"Expected tokens shaped [images, tokens, dim], got {tokens.shape}")
@@ -70,7 +122,11 @@ def pool_sae_image_batch(
         ).to(device=device, non_blocking=True)
         flat_chunk = image_chunk.reshape(-1, d_model)
         with autocast_context(device, precision):
-            acts = encode_sae(model, flat_chunk).float()
+            acts = encode_sae(
+                model,
+                flat_chunk,
+                inference_mode=inference_mode,
+            ).float()
         acts = acts.reshape(end - start, tokens_per_image, d_sae)
         h_mean[start:end] = acts.mean(dim=1).cpu()
         h_max[start:end] = acts.amax(dim=1).cpu()

@@ -30,3 +30,18 @@ For extraction configs, the important encoder fields are:
 - `data.write_absolute_paths`: optional, defaults to `false`; token-cache records always write `relative_path`, and only write absolute `path` fields when this is enabled
 
 For `build-h` / `inspect` configs, keep `data.root` set when you want preview generation to work with relative-only token caches. Inspection first uses an absolute `path` if present, then falls back to `data.root + relative_path`, and otherwise skips previews cleanly.
+
+Important runtime knobs added in the current public surface:
+
+- `tokens.stats_dir`: directory containing `activation_mean.npy`, `activation_scale.json`, and optional variance stats from `compute-token-stats`
+- `train.backend`: `torch_dense`, `torch_sparse`, or `triton_sparse`
+- `train.normalize_inputs`: train in normalized activation space
+- `train.init_decoder_bias_from_stats`: initialize decoder bias from loaded token stats when appropriate
+- `train.max_train_rows` / `train.max_val_rows`: fast smoke-run limits for patch-row datasets
+- `train.warmup_steps`, `train.lr_decay`, `train.min_lr_fraction`, `train.resume_from`
+- `sae.aux_k`, `sae.dead_steps_threshold`, `sae.aux_loss_weight`
+- `build_h.inference_mode`: `per_row_topk` for chunk-invariant inference, or `batchtopk_train_style` for legacy reproduction
+
+`inspect` does not take a separate inference-mode override. It follows the recorded mode in the
+concept directory so that previews, rescoring, and token-level scans stay internally consistent
+with the way `H` was built.

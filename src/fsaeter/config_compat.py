@@ -113,7 +113,14 @@ def normalize_build_h_config(config: dict) -> dict:
     pooling = dict(cfg.get("pooling") or {})
     qc = dict(cfg.get("qc") or {})
 
-    for key in ("device", "precision", "image_batch_size", "token_batch_size", "max_images"):
+    for key in (
+        "device",
+        "precision",
+        "image_batch_size",
+        "token_batch_size",
+        "max_images",
+        "inference_mode",
+    ):
         if key in inference and key not in build_h:
             build_h[key] = inference[key]
     for key in (

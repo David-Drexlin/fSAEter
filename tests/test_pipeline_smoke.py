@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -135,6 +136,7 @@ build_h:
   image_batch_size: 2
   token_batch_size: 8
   max_images: 2
+  inference_mode: per_row_topk
 inspect:
   device: cpu
   candidate_score_mode: max
@@ -152,7 +154,19 @@ inspect:
         import os
         os.chdir(tmp_path)
         assert main(["compute-token-stats", "--config", str(stats_cfg)]) == 0
-        assert main(["train-sae", "--config", str(train_cfg)]) == 0
+        assert main(
+            [
+                "train-sae",
+                "--config",
+                str(train_cfg),
+                "--backend",
+                "torch_sparse",
+                "--max-train-rows",
+                "8",
+                "--max-val-rows",
+                "4",
+            ]
+        ) == 0
         assert main(["build-h", "--config", str(build_cfg)]) == 0
         assert main(["inspect", "--config", str(build_cfg)]) == 0
     finally:
@@ -162,6 +176,14 @@ inspect:
     assert (tmp_path / "out" / "h" / "h_image_rows.npy").exists()
     assert (tmp_path / "out" / "h" / "feature_top_tokens.npz").exists()
     assert (tmp_path / "out" / "h" / "qc_summary.json").exists()
+    build_summary = json.loads((tmp_path / "out" / "h" / "build_summary.json").read_text(encoding="utf-8"))
+    concept_metadata = json.loads(
+        (tmp_path / "out" / "h" / "concept_metadata.json").read_text(encoding="utf-8")
+    )
+    qc_summary = json.loads((tmp_path / "out" / "h" / "qc_summary.json").read_text(encoding="utf-8"))
+    assert build_summary["inference_mode"] == "per_row_topk"
+    assert concept_metadata["build_h"]["inference_mode"] == "per_row_topk"
+    assert qc_summary["inference_mode"] == "per_row_topk"
 
 
 def test_inspect_resolves_relative_only_records_with_data_root(tmp_path: Path):
@@ -292,6 +314,142 @@ inspect:
     qc_summary = json.loads((tmp_path / "out" / "h" / "qc_summary.json").read_text(encoding="utf-8"))
     assert qc_summary["previews"]["images_skipped_missing_source"] > 0
     assert not (tmp_path / "out" / "h" / "top_images").exists()
+
+
+def test_inspect_legacy_inference_mode_defaults_to_batchtopk(tmp_path: Path):
+    write_cache(tmp_path)
+    train_cfg = tmp_path / "train.yaml"
+    train_cfg.write_text(
+        """
+run:
+  seed: 5
+  out_dir: out/train
+tokens:
+  cache_dir: tokens
+sae:
+  variant: batchtopk
+  d_model: 8
+  d_sae: 16
+  target_k: 2
+train:
+  device: cpu
+  precision: fp32
+  batch_size: 4
+  epochs: 1
+  num_workers: 0
+""",
+        encoding="utf-8",
+    )
+    build_cfg = tmp_path / "build.yaml"
+    build_cfg.write_text(
+        """
+run:
+  out_dir: out/h
+tokens:
+  cache_dir: tokens
+sae:
+  checkpoint: out/train/checkpoints/best.pt
+build_h:
+  device: cpu
+  precision: fp32
+  image_batch_size: 2
+  token_batch_size: 8
+  inference_mode: per_row_topk
+inspect:
+  device: cpu
+  preview_concepts: 2
+  preview_images_per_concept: 2
+  min_support: 1
+  min_class_coverage: 1
+  min_per_class: 1
+""",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    try:
+        import os
+
+        os.chdir(tmp_path)
+        assert main(["train-sae", "--config", str(train_cfg)]) == 0
+        assert main(["build-h", "--config", str(build_cfg)]) == 0
+
+        build_summary_path = tmp_path / "out" / "h" / "build_summary.json"
+        build_summary = json.loads(build_summary_path.read_text(encoding="utf-8"))
+        build_summary.pop("inference_mode", None)
+        build_summary_path.write_text(
+            json.dumps(build_summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        metadata_path = tmp_path / "out" / "h" / "concept_metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["build_h"].pop("inference_mode", None)
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        assert main(["inspect", "--config", str(build_cfg)]) == 0
+    finally:
+        os.chdir(cwd)
+
+    qc_summary = json.loads((tmp_path / "out" / "h" / "qc_summary.json").read_text(encoding="utf-8"))
+    concept_metadata = json.loads(
+        (tmp_path / "out" / "h" / "concept_metadata.json").read_text(encoding="utf-8")
+    )
+    assert qc_summary["inference_mode"] == "batchtopk_train_style"
+    assert concept_metadata["build_h"]["inference_mode"] == "batchtopk_train_style"
+
+
+def test_build_h_rejects_sparse_csr_request(tmp_path: Path):
+    write_cache(tmp_path)
+    train_cfg = tmp_path / "train.yaml"
+    train_cfg.write_text(
+        """
+run:
+  out_dir: out/train
+tokens:
+  cache_dir: tokens
+sae:
+  variant: batchtopk
+  d_model: 8
+  d_sae: 16
+  target_k: 2
+train:
+  device: cpu
+  precision: fp32
+  batch_size: 4
+  epochs: 1
+  num_workers: 0
+""",
+        encoding="utf-8",
+    )
+    build_cfg = tmp_path / "build.yaml"
+    build_cfg.write_text(
+        """
+run:
+  out_dir: out/h
+tokens:
+  cache_dir: tokens
+sae:
+  checkpoint: out/train/checkpoints/best.pt
+build_h:
+  device: cpu
+  precision: fp32
+  save_sparse_csr: true
+""",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    try:
+        import os
+
+        os.chdir(tmp_path)
+        assert main(["train-sae", "--config", str(train_cfg)]) == 0
+        with pytest.raises(NotImplementedError):
+            main(["build-h", "--config", str(build_cfg)])
+    finally:
+        os.chdir(cwd)
 
 
 def test_train_seed_produces_stable_splits_and_metrics(tmp_path: Path):

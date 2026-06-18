@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from fsaeter.inspect.basic_qc import (
+    resolve_stored_inference_mode,
     select_localized_concepts,
     select_broad_concepts,
     select_sparse_topk_rows,
@@ -71,3 +72,23 @@ def test_select_localized_concepts_prefers_sparse_high_peak_features():
         top_n=3,
     )
     assert candidates[0]["concept_id"] == 2
+
+
+def test_resolve_stored_inference_mode_defaults_legacy_dirs_to_batchtopk():
+    assert (
+        resolve_stored_inference_mode(
+            concept_metadata=None,
+            build_summary=None,
+        )
+        == "batchtopk_train_style"
+    )
+
+
+def test_resolve_stored_inference_mode_prefers_recorded_value():
+    assert (
+        resolve_stored_inference_mode(
+            concept_metadata={"build_h": {"inference_mode": "per_row_topk"}},
+            build_summary={"inference_mode": "batchtopk_train_style"},
+        )
+        == "per_row_topk"
+    )

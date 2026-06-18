@@ -14,7 +14,7 @@ import torch
 from PIL import Image, ImageOps
 
 from fsaeter.data.cache import resolve_token_cache_info
-from fsaeter.h.helpers import encode_sae
+from fsaeter.h.helpers import encode_sae, normalize_inference_mode
 from fsaeter.models.local_sae import load_local_sae_checkpoint
 
 
@@ -530,6 +530,29 @@ def load_build_summary(concept_dir: Path) -> dict | None:
     return None
 
 
+def load_concept_metadata(concept_dir: Path) -> dict | None:
+    metadata_path = concept_dir / "concept_metadata.json"
+    if metadata_path.exists():
+        return json.loads(metadata_path.read_text(encoding="utf-8"))
+    return None
+
+
+def resolve_stored_inference_mode(
+    *,
+    concept_metadata: dict | None,
+    build_summary: dict | None,
+) -> str:
+    stored = None
+    if isinstance(concept_metadata, dict):
+        stored = dict(concept_metadata.get("build_h") or {}).get("inference_mode")
+    if stored is None and isinstance(build_summary, dict):
+        stored = build_summary.get("inference_mode")
+    return normalize_inference_mode(
+        stored,
+        default="batchtopk_train_style",
+    )
+
+
 def scan_feature_top_tokens(
     *,
     concept_ids: Sequence[int],
@@ -540,6 +563,7 @@ def scan_feature_top_tokens(
     device: torch.device,
     precision: str,
     top_n: int,
+    inference_mode: str,
 ) -> dict[str, np.ndarray]:
     concept_ids_arr = np.asarray(sorted({int(v) for v in concept_ids}), dtype=np.int64)
     concept_ids_list = [int(v) for v in concept_ids_arr.tolist()]
@@ -566,7 +590,11 @@ def scan_feature_top_tokens(
         )
         with torch.no_grad():
             acts = (
-                encode_sae(model, token_batch.to(device=device, non_blocking=True))
+                encode_sae(
+                    model,
+                    token_batch.to(device=device, non_blocking=True),
+                    inference_mode=inference_mode,
+                )
                 .float()
                 .cpu()
                 .reshape(
@@ -628,6 +656,13 @@ def run_basic_qc(
     tokens_dir = Path(tokens_dir).expanduser().resolve()
     resolved_data_root = None if data_root is None else Path(data_root).expanduser().resolve()
     token_info = resolve_token_cache_info(tokens_dir)
+
+    concept_metadata = load_concept_metadata(concept_dir)
+    build_summary = load_build_summary(concept_dir)
+    inference_mode = resolve_stored_inference_mode(
+        concept_metadata=concept_metadata,
+        build_summary=build_summary,
+    )
 
     candidate_top_indices, candidate_top_values = load_candidate_sparse_pair(
         concept_dir,
@@ -718,6 +753,7 @@ def run_basic_qc(
             "concept_dir": str(concept_dir),
             "checkpoint": str(Path(checkpoint_path).expanduser().resolve()),
             "candidate_score_mode": str(candidate_score_mode).lower(),
+            "inference_mode": inference_mode,
             "miners": normalized_miners,
             "num_candidates": int(len(flattened_candidates)),
             "candidates": flattened_candidates,
@@ -726,7 +762,6 @@ def run_basic_qc(
     )
 
     train_summary = load_train_summary(checkpoint_path)
-    build_summary = load_build_summary(concept_dir)
     qc_summary = {
         "tuple_uniqueness": tuple_uniqueness_rates(candidate_top_indices, sizes=(1, 4, 8)),
         "feature_image_frequency_mean": summarize_feature_frequency(image_frequency_mean),
@@ -735,6 +770,7 @@ def run_basic_qc(
         "candidate_counts": {key: int(len(value)) for key, value in candidate_payload.items()},
         "active_threshold": float(active_threshold),
         "candidate_score_mode": str(candidate_score_mode).lower(),
+        "inference_mode": inference_mode,
         "miners": normalized_miners,
         "token_frequency_mean": float(np.asarray(token_frequency, dtype=np.float64).mean()),
         "train_summary": train_summary,
@@ -808,7 +844,11 @@ def run_basic_qc(
         ).reshape(-1, int(token_info.d_model))
         with torch.no_grad():
             acts = (
-                encode_sae(model, token_batch.to(device=device, non_blocking=True))
+                encode_sae(
+                    model,
+                    token_batch.to(device=device, non_blocking=True),
+                    inference_mode=inference_mode,
+                )
                 .float()
                 .cpu()
                 .reshape(
@@ -896,6 +936,7 @@ def run_basic_qc(
         device=device,
         precision=precision,
         top_n=max(1, int(preview_images_per_concept)),
+        inference_mode=inference_mode,
     )
     np.savez_compressed(concept_dir / "feature_top_tokens.npz", **feature_scan)
 
@@ -974,10 +1015,9 @@ def run_basic_qc(
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
     metadata_path = concept_dir / "concept_metadata.json"
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    else:
-        metadata = {}
+    metadata = concept_metadata or {}
+    metadata.setdefault("build_h", {})
+    metadata["build_h"].setdefault("inference_mode", inference_mode)
     metadata["qc"] = {
         "summary_path": str(concept_dir / "qc_summary.json"),
         "candidate_path": str(concept_dir / "candidate_concepts.json"),

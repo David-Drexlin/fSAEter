@@ -208,4 +208,5 @@ def test_load_local_sae_checkpoint_warns_and_falls_back_for_legacy_load(
     assert isinstance(loaded_model, LocalSparseAutoencoder)
     assert payload["epoch"] == 1
     assert any(kwargs.get("weights_only") for kwargs in call_kwargs)
+    assert any(kwargs.get("weights_only") is False for kwargs in call_kwargs)
     assert any("legacy torch.load" in str(item.message) for item in caught)

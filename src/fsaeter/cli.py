@@ -83,7 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--tokens", default=None)
     p_train.add_argument("--out", default=None)
     p_train.add_argument("--device", default=None)
+    p_train.add_argument("--backend", default=None)
     p_train.add_argument("--epochs", type=int, default=None)
+    p_train.add_argument("--max-train-rows", type=int, default=None)
+    p_train.add_argument("--max-val-rows", type=int, default=None)
     p_train.add_argument("--dry-run", action="store_true")
 
     p_build = sub.add_parser("build-h", help="Build H matrices from a local SAE checkpoint.")
@@ -165,8 +168,14 @@ def _apply_train_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["run"]["out_dir"] = args.out
     if args.device is not None:
         config["train"]["device"] = args.device
+    if args.backend is not None:
+        config["train"]["backend"] = str(args.backend)
     if args.epochs is not None:
         config["train"]["epochs"] = int(args.epochs)
+    if args.max_train_rows is not None:
+        config["train"]["max_train_rows"] = int(args.max_train_rows)
+    if args.max_val_rows is not None:
+        config["train"]["max_val_rows"] = int(args.max_val_rows)
     return config
 
 
@@ -383,6 +392,9 @@ def preview_train_command(config: dict, *, base_root: Path) -> dict:
         "d_sae": int(sae_cfg.get("d_sae", 0)),
         "epochs": int(train_cfg.get("epochs", 1)),
         "batch_size": int(train_cfg.get("batch_size", 1024)),
+        "backend": str(train_cfg.get("backend", "torch_sparse")),
+        "max_train_rows": train_cfg.get("max_train_rows"),
+        "max_val_rows": train_cfg.get("max_val_rows"),
     }
 
 
@@ -402,6 +414,7 @@ def preview_build_command(config: dict, *, base_root: Path) -> dict:
         "token_shape": [int(token_info.num_images), int(token_info.tokens_per_image), int(token_info.d_model)],
         "num_images_to_process": int(max_images),
         "checkpoint": str(resolve_path(config["sae"]["checkpoint"], base=base_root)),
+        "inference_mode": str(build_cfg.get("inference_mode", "per_row_topk")),
     }
 
 

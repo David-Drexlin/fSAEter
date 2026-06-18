@@ -10,7 +10,7 @@ import torch
 
 from fsaeter.config_compat import normalize_build_h_config
 from fsaeter.data.cache import resolve_token_cache_info
-from fsaeter.h.helpers import pool_sae_image_batch
+from fsaeter.h.helpers import normalize_inference_mode, pool_sae_image_batch
 from fsaeter.inspect.basic_qc import select_sparse_topk_rows
 from fsaeter.models.local_sae import load_local_sae_checkpoint, payload_to_local_sae_info
 from fsaeter.utils.config import resolve_path, save_yaml_config
@@ -59,12 +59,22 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     save_topk_mean = bool(build_cfg.get("save_topk_mean", True))
     save_topk_max = bool(build_cfg.get("save_topk_max", True))
     save_sparse_csr_requested = bool(build_cfg.get("save_sparse_csr", False))
+    inference_mode = normalize_inference_mode(
+        build_cfg.get("inference_mode"),
+        default="per_row_topk",
+    )
     image_top_k = min(int(build_cfg.get("image_top_k", 64)), int(model.d_sae))
     active_threshold = float(build_cfg.get("active_threshold", 1e-6))
     image_batch_size = max(1, int(build_cfg.get("image_batch_size", 16)))
     token_batch_size = max(1, int(build_cfg.get("token_batch_size", 2048)))
     precision = str(build_cfg.get("precision", "fp32"))
     h_rows = np.arange(int(max_images), dtype=np.int64)
+
+    if save_sparse_csr_requested:
+        raise NotImplementedError(
+            "build_h.save_sparse_csr=true is not implemented in this tranche. "
+            "Use save_topk_mean/save_topk_max or dense H outputs instead."
+        )
 
     dense_mean = None
     dense_max = None
@@ -141,6 +151,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             token_batch_size=token_batch_size,
             precision=precision,
             active_threshold=active_threshold,
+            inference_mode=inference_mode,
         )
         if dense_mean is not None:
             dense_mean[start:end] = mean_rows.numpy().astype(save_dtype, copy=False)
@@ -221,6 +232,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
         "out_dir": str(out_dir),
         "max_images": int(max_images),
         "image_top_k": int(image_top_k),
+        "inference_mode": inference_mode,
         "save_dense_mean": bool(save_dense_mean),
         "save_dense_max": bool(save_dense_max),
         "save_topk_mean": bool(save_topk_mean),
@@ -285,6 +297,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             "build_summary": str(out_dir / "build_summary.json"),
             "image_top_k": int(image_top_k),
             "active_threshold": float(active_threshold),
+            "inference_mode": inference_mode,
             "sparse_topk": True,
             "save_dtype": str(save_dtype),
             "save_sparse_csr_requested": bool(save_sparse_csr_requested),
