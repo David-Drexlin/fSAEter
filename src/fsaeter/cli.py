@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -35,13 +35,13 @@ from fsaeter.utils.config import (
     runtime_base_root,
     save_yaml_config,
 )
+from fsaeter.utils.distributed import is_distributed, is_main_process
 from fsaeter.utils.repro import (
     build_dataloader_generator,
     build_worker_init_fn,
     resolve_run_seed,
     seed_everything,
 )
-from fsaeter.utils.distributed import is_distributed, is_main_process
 
 
 def get_device(device_value: str) -> torch.device:

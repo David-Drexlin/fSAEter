@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import random
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-import json
 from pathlib import Path
-import random
 from typing import Any
 
 from torch.utils.data import Dataset

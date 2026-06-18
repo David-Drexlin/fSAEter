@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -23,12 +23,6 @@ from fsaeter.models.local_sae import (
     save_local_sae_checkpoint,
 )
 from fsaeter.utils.config import resolve_path, save_yaml_config
-from fsaeter.utils.repro import (
-    build_dataloader_generator,
-    build_worker_init_fn,
-    resolve_run_seed,
-    seed_everything,
-)
 from fsaeter.utils.distributed import (
     barrier,
     cleanup_distributed,
@@ -37,6 +31,12 @@ from fsaeter.utils.distributed import (
     is_main_process,
     local_rank,
     world_size,
+)
+from fsaeter.utils.repro import (
+    build_dataloader_generator,
+    build_worker_init_fn,
+    resolve_run_seed,
+    seed_everything,
 )
 
 
