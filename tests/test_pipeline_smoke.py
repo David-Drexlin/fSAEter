@@ -401,7 +401,28 @@ inspect:
     assert concept_metadata["build_h"]["inference_mode"] == "batchtopk_train_style"
 
 
-def test_build_h_rejects_sparse_csr_request(tmp_path: Path):
+def _decode_csr_rows(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    values: np.ndarray,
+    *,
+    num_rows: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    dense_indices = np.full((num_rows, width), -1, dtype=np.int32)
+    dense_values = np.zeros((num_rows, width), dtype=values.dtype)
+    for row_idx in range(num_rows):
+        start = int(indptr[row_idx])
+        end = int(indptr[row_idx + 1])
+        count = max(0, min(width, end - start))
+        if count <= 0:
+            continue
+        dense_indices[row_idx, :count] = indices[start : start + count]
+        dense_values[row_idx, :count] = values[start : start + count]
+    return dense_indices, dense_values
+
+
+def test_build_h_writes_sparse_csr_exports(tmp_path: Path):
     write_cache(tmp_path)
     train_cfg = tmp_path / "train.yaml"
     train_cfg.write_text(
@@ -446,10 +467,44 @@ build_h:
 
         os.chdir(tmp_path)
         assert main(["train-sae", "--config", str(train_cfg)]) == 0
-        with pytest.raises(NotImplementedError):
-            main(["build-h", "--config", str(build_cfg)])
+        assert main(["build-h", "--config", str(build_cfg)]) == 0
     finally:
         os.chdir(cwd)
+
+    out_dir = tmp_path / "out" / "h"
+    build_summary = json.loads((out_dir / "build_summary.json").read_text(encoding="utf-8"))
+    assert build_summary["save_sparse_csr_written"] is True
+
+    mean_top_indices = np.load(out_dir / "H_mean_top_indices.npy")
+    mean_top_values = np.load(out_dir / "H_mean_top_values.npy")
+    max_top_indices = np.load(out_dir / "H_max_top_indices.npy")
+    max_top_values = np.load(out_dir / "H_max_top_values.npy")
+
+    mean_indptr = np.load(out_dir / "H_mean_csr_indptr.npy")
+    mean_indices = np.load(out_dir / "H_mean_csr_indices.npy")
+    mean_values = np.load(out_dir / "H_mean_csr_values.npy")
+    max_indptr = np.load(out_dir / "H_max_csr_indptr.npy")
+    max_indices = np.load(out_dir / "H_max_csr_indices.npy")
+    max_values = np.load(out_dir / "H_max_csr_values.npy")
+
+    decoded_mean_indices, decoded_mean_values = _decode_csr_rows(
+        mean_indptr,
+        mean_indices,
+        mean_values,
+        num_rows=mean_top_indices.shape[0],
+        width=mean_top_indices.shape[1],
+    )
+    decoded_max_indices, decoded_max_values = _decode_csr_rows(
+        max_indptr,
+        max_indices,
+        max_values,
+        num_rows=max_top_indices.shape[0],
+        width=max_top_indices.shape[1],
+    )
+    np.testing.assert_array_equal(decoded_mean_indices, mean_top_indices)
+    np.testing.assert_allclose(decoded_mean_values, mean_top_values)
+    np.testing.assert_array_equal(decoded_max_indices, max_top_indices)
+    np.testing.assert_allclose(decoded_max_values, max_top_values)
 
 
 def test_train_seed_produces_stable_splits_and_metrics(tmp_path: Path):
@@ -495,3 +550,113 @@ train:
     assert [row["epoch"] for row in history_a] == [row["epoch"] for row in history_b]
     assert [row["train"] for row in history_a] == [row["train"] for row in history_b]
     assert [row["val"] for row in history_a] == [row["val"] for row in history_b]
+
+
+def test_train_sae_step_mode_and_compare_runs_smoke(tmp_path: Path):
+    write_cache(tmp_path)
+    stats_cfg = tmp_path / "stats.yaml"
+    stats_cfg.write_text(
+        """
+run:
+  out_dir: out/stats
+tokens:
+  cache_dir: tokens
+  stats_dir: out/stats
+""",
+        encoding="utf-8",
+    )
+    train_cfg = tmp_path / "train.yaml"
+    train_cfg.write_text(
+        """
+run:
+  seed: 23
+tokens:
+  cache_dir: tokens
+  stats_dir: out/stats
+sae:
+  variant: batchtopk
+  d_model: 8
+  d_sae: 16
+  target_k: 2
+train:
+  device: cpu
+  precision: fp32
+  batch_size: 4
+  epochs: 3
+  max_steps: 3
+  val_every_steps: 2
+  checkpoint_every_steps: 2
+  log_every_steps: 1
+  num_workers: 0
+  backend: torch_sparse
+  normalize_inputs: true
+""",
+        encoding="utf-8",
+    )
+    build_cfg = tmp_path / "build.yaml"
+    build_cfg.write_text(
+        """
+run:
+  out_dir: out/h
+tokens:
+  cache_dir: tokens
+sae:
+  checkpoint: out/train/checkpoints/best.pt
+build_h:
+  device: cpu
+  precision: fp32
+  image_batch_size: 2
+  token_batch_size: 8
+  inference_mode: per_row_topk
+inspect:
+  device: cpu
+  preview_concepts: 2
+  preview_images_per_concept: 2
+  min_support: 1
+  min_class_coverage: 1
+  min_per_class: 1
+""",
+        encoding="utf-8",
+    )
+    cwd = Path.cwd()
+    try:
+        import os
+
+        os.chdir(tmp_path)
+        assert main(["compute-token-stats", "--config", str(stats_cfg)]) == 0
+        assert main(["train-sae", "--config", str(train_cfg), "--out", "out/train"]) == 0
+        assert main(["build-h", "--config", str(build_cfg)]) == 0
+        assert main(["inspect", "--config", str(build_cfg)]) == 0
+        assert (
+            main(
+                [
+                    "compare-runs",
+                    "--config",
+                    str(build_cfg),
+                    "--run-a",
+                    "out/train",
+                    "--run-b",
+                    "out/train",
+                    "--concept-dir-a",
+                    "out/h",
+                    "--concept-dir-b",
+                    "out/h",
+                    "--out",
+                    "out/compare",
+                ]
+            )
+            == 0
+        )
+    finally:
+        os.chdir(cwd)
+
+    train_summary = json.loads((tmp_path / "out" / "train" / "train_summary.json").read_text(encoding="utf-8"))
+    assert train_summary["global_step"] == 3
+    assert train_summary["max_steps"] == 3
+    assert train_summary["training_sparsity_mode"] == "batchtopk_train_style"
+    metrics_lines = (tmp_path / "out" / "train" / "metrics.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(metrics_lines) >= 2
+    stability = json.loads((tmp_path / "out" / "compare" / "stability_summary.json").read_text(encoding="utf-8"))
+    assert stability["decoder_cosine_mean"] == pytest.approx(1.0)
+    assert stability["top_token_jaccard_mean"] == pytest.approx(1.0)
+    assert stability["candidate_concept_overlap"] == pytest.approx(1.0)

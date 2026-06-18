@@ -118,17 +118,24 @@ def _ddp_stats_worker(rank: int, world_size: int, port: int, out_dir: str) -> No
     os.environ["LOCAL_RANK"] = str(rank)
 
     init_distributed(torch.device("cpu"))
-    stats = RunningFeatureStats(d_sae=4)
+    stats = RunningFeatureStats(d_sae=4, d_model=4)
     features = (
         torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 2.0, 0.0, 0.0]])
         if rank == 0
         else torch.tensor([[0.0, 0.0, 3.0, 0.0], [0.0, 0.0, 0.0, 4.0]])
     )
+    target = torch.tensor(
+        [[1.0, 0.0, 0.5, -0.5], [0.0, 2.0, -0.5, 0.5]],
+        dtype=torch.float32,
+    )
+    recon = target.clone()
     stats.update(
         batch_size=2,
         loss=torch.tensor(1.0 + rank, dtype=torch.float32),
         recon_mse=torch.tensor(0.5 + rank, dtype=torch.float32),
         aux_loss=torch.tensor(0.25 * (rank + 1), dtype=torch.float32),
+        target=target,
+        recon=recon,
         features=features,
     )
     summary, feature_frequency = stats.reduced_summary(device=torch.device("cpu"))
@@ -165,6 +172,54 @@ def test_running_feature_stats_reduce_across_ddp_ranks(tmp_path: Path):
     assert rank0["max_l0"] == 2
     assert rank0["dead_fraction"] == pytest.approx(0.0)
     assert rank0["feature_frequency"] == pytest.approx([0.25, 0.25, 0.5, 0.25])
+
+
+def test_running_feature_stats_reports_reconstruction_and_l0_metrics():
+    stats = RunningFeatureStats(d_sae=4, d_model=3)
+    features = torch.tensor(
+        [
+            [1.0, 0.0, 2.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [4.0, 5.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    target = torch.tensor(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [7.0, 8.0, 9.0],
+        ],
+        dtype=torch.float32,
+    )
+    recon = target.clone()
+    recon[0, 0] += 1.0
+    stats.update(
+        batch_size=3,
+        loss=torch.tensor(0.5, dtype=torch.float32),
+        recon_mse=torch.tensor(0.25, dtype=torch.float32),
+        aux_loss=torch.tensor(0.1, dtype=torch.float32),
+        target=target,
+        recon=recon,
+        features=features,
+    )
+    summary = stats.summary()
+    assert summary.loss == pytest.approx(0.5)
+    assert summary.recon_mse == pytest.approx(0.25)
+    assert summary.aux_loss == pytest.approx(0.1)
+    assert summary.mean_l0 == pytest.approx(5.0 / 3.0)
+    assert summary.p50_l0 == pytest.approx(2.0)
+    assert summary.p90_l0 == pytest.approx(2.0)
+    assert summary.p99_l0 == pytest.approx(2.0)
+    assert summary.max_l0 == 2
+    assert summary.alive_fraction == pytest.approx(0.75)
+    assert summary.dead_fraction == pytest.approx(0.25)
+    assert summary.dead_feature_count == 1
+    assert summary.mse == pytest.approx(1.0 / 9.0)
+    zero_baseline = float((target.pow(2).sum() / target.numel()).item())
+    assert summary.zero_baseline_mse == pytest.approx(zero_baseline)
+    assert summary.normalized_mse == pytest.approx(summary.mse / zero_baseline)
+    assert summary.variance_explained < 1.0
 
 
 def test_load_local_sae_checkpoint_warns_and_falls_back_for_legacy_load(

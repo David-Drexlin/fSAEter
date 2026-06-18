@@ -6,6 +6,7 @@ import json
 import math
 import random
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from fsaeter.data.datasets import PatchTokenMemmapDataset, split_image_rows
 from fsaeter.h.helpers import autocast_context
 from fsaeter.models.local_sae import (
     RunningFeatureStats,
+    StepMetrics,
     build_local_sae,
     save_local_sae_checkpoint,
 )
@@ -169,6 +171,31 @@ def load_training_stats_into_model(model: torch.nn.Module, config: dict, *, base
     return stats_dir
 
 
+def step_metrics_to_dict(metrics: StepMetrics) -> dict:
+    return asdict(metrics)
+
+
+def empty_step_metrics() -> dict:
+    return {
+        "loss": float("nan"),
+        "recon_mse": float("nan"),
+        "aux_loss": float("nan"),
+        "mse": float("nan"),
+        "normalized_mse": float("nan"),
+        "zero_baseline_mse": float("nan"),
+        "mean_baseline_mse": float("nan"),
+        "variance_explained": float("nan"),
+        "mean_l0": float("nan"),
+        "p50_l0": float("nan"),
+        "p90_l0": float("nan"),
+        "p99_l0": float("nan"),
+        "max_l0": 0,
+        "alive_fraction": float("nan"),
+        "dead_fraction": float("nan"),
+        "dead_feature_count": 0,
+    }
+
+
 def run_epoch(
     *,
     model: torch.nn.Module,
@@ -184,7 +211,10 @@ def run_epoch(
 ) -> tuple[dict, np.ndarray, int]:
     is_train = optimizer is not None
     base_model = _unwrap_model(model)
-    stats = RunningFeatureStats(d_sae=int(base_model.d_sae))
+    stats = RunningFeatureStats(
+        d_sae=int(base_model.d_sae),
+        d_model=int(base_model.d_model),
+    )
     current_step = int(global_step)
 
     for batch in loader:
@@ -232,18 +262,13 @@ def run_epoch(
             loss=outputs["loss"].detach(),
             recon_mse=outputs["recon_mse"].detach(),
             aux_loss=outputs["aux_loss"].detach(),
+            target=outputs["target"].detach(),
+            recon=outputs["recon"].detach(),
             features=outputs["features"],
         )
 
     reduced_summary, feature_frequency = stats.reduced_summary(device=device)
-    return {
-        "loss": float(reduced_summary.loss),
-        "recon_mse": float(reduced_summary.recon_mse),
-        "aux_loss": float(reduced_summary.aux_loss),
-        "mean_l0": float(reduced_summary.mean_l0),
-        "max_l0": int(reduced_summary.max_l0),
-        "dead_fraction": float(reduced_summary.dead_fraction),
-    }, feature_frequency, current_step
+    return step_metrics_to_dict(reduced_summary), feature_frequency, current_step
 
 
 def run_training(config: dict, *, base_root: Path) -> dict:
@@ -302,6 +327,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     batch_size = max(1, int(train_cfg.get("batch_size", 1024)))
     num_workers = max(0, int(train_cfg.get("num_workers", 4)))
     epochs = max(1, int(train_cfg.get("epochs", 1)))
+    max_steps_cfg = train_cfg.get("max_steps")
+    max_steps = None
+    if max_steps_cfg not in (None, "", 0, "0"):
+        max_steps = max(1, int(max_steps_cfg))
     grad_clip_norm = train_cfg.get("grad_clip_norm")
     if grad_clip_norm is not None:
         grad_clip_norm = float(grad_clip_norm)
@@ -361,7 +390,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
 
     optimizer = build_optimizer(model, train_cfg)
-    total_steps = epochs * max(1, len(train_loader))
+    total_steps = int(max_steps) if max_steps is not None else epochs * max(1, len(train_loader))
     scheduler = build_scheduler(optimizer, total_steps=total_steps, train_cfg=train_cfg)
     scaler = (
         torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and precision_is_fp16(train_cfg))
@@ -374,13 +403,14 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     history: list[dict] = []
     best_val_loss: float | None = None
     best_epoch = -1
-    metrics_jsonl = out_dir / "epoch_metrics.jsonl"
+    metrics_jsonl = out_dir / "metrics.jsonl"
+    legacy_metrics_jsonl = out_dir / "epoch_metrics.jsonl"
     start_epoch = 1
     global_step = 0
     resume_from = train_cfg.get("resume_from")
     if resume_from:
         resume_path = resolve_path(resume_from, base=base_root)
-        payload = torch.load(resume_path, map_location=device)
+        payload = torch.load(resume_path, map_location=device, weights_only=False)
         _unwrap_model(model).load_state_dict(payload["state_dict"])
         if payload.get("optimizer") is not None:
             optimizer.load_state_dict(payload["optimizer"])
@@ -400,36 +430,50 @@ def run_training(config: dict, *, base_root: Path) -> dict:
             "backend": str(backend.name),
             "stats_dir": None if stats_dir is None else str(stats_dir),
             "resume_from": None if not resume_from else str(resolve_path(resume_from, base=base_root)),
+            "training_sparsity_mode": "batchtopk_train_style",
         }
         (out_dir / "run_context.json").write_text(
             json.dumps(summary_seed, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+    def write_metrics_record(record: dict, *, write_legacy: bool = False) -> None:
+        if not is_main_process():
+            return
+        with metrics_jsonl.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if write_legacy:
+            with legacy_metrics_jsonl.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
 
-    for epoch in range(start_epoch, epochs + 1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        if val_sampler is not None:
-            val_sampler.set_epoch(epoch)
+    def current_scaler_state():
+        if scaler is None or not scaler.is_enabled():
+            return None
+        return scaler.state_dict()
 
-        epoch_start = time.time()
-        model.train()
-        train_metrics, train_feature_freq, global_step = run_epoch(
-            model=model,
-            backend=backend,
-            loader=train_loader,
-            device=device,
-            precision=precision,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            grad_clip_norm=grad_clip_norm,
-            global_step=global_step,
+    def checkpoint_kwargs() -> dict:
+        return {
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": None if scheduler is None else scheduler.state_dict(),
+            "scaler_state": current_scaler_state(),
+            "rng_state": capture_rng_state(),
+        }
+
+    def save_checkpoint_file(path: Path, *, epoch: int) -> None:
+        save_local_sae_checkpoint(
+            path,
+            model=_unwrap_model(model),
+            config=config,
+            epoch=epoch,
+            step=global_step,
+            best_val_loss=best_val_loss,
+            history=history,
+            **checkpoint_kwargs(),
         )
 
+    def evaluate_current_model() -> tuple[dict, np.ndarray]:
         model.eval()
         if len(val_set) > 0:
-            val_metrics, val_feature_freq, _ = run_epoch(
+            val_metrics_local, val_feature_freq_local, _ = run_epoch(
                 model=model,
                 backend=backend,
                 loader=val_loader,
@@ -442,107 +486,341 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 global_step=global_step,
             )
         else:
-            val_metrics = {
-                key: float("nan")
-                for key in ("loss", "recon_mse", "aux_loss", "mean_l0", "dead_fraction")
-            }
-            val_metrics["max_l0"] = 0
-            val_feature_freq = np.zeros((int(_unwrap_model(model).d_sae),), dtype=np.float32)
+            val_metrics_local = empty_step_metrics()
+            val_feature_freq_local = np.zeros((int(_unwrap_model(model).d_sae),), dtype=np.float32)
+        model.train()
+        return val_metrics_local, val_feature_freq_local
 
-        epoch_seconds = float(time.time() - epoch_start)
-        current_lr = float(optimizer.param_groups[0]["lr"])
-        record = {
-            "epoch": epoch,
+    def write_summary(
+        *,
+        completed_epochs: int,
+        current_lr: float,
+        last_train: dict,
+        last_val: dict,
+    ) -> None:
+        if not is_main_process():
+            return
+        train_summary = {
+            "out_dir": str(out_dir),
+            "backend": str(backend.name),
+            "epochs": int(epochs),
+            "completed_epochs": int(completed_epochs),
             "global_step": int(global_step),
-            "epoch_seconds": epoch_seconds,
+            "seed": int(seed),
+            "stats_dir": None if stats_dir is None else str(stats_dir),
+            "best_epoch": int(best_epoch),
+            "best_val_loss": None if best_val_loss is None else float(best_val_loss),
+            "last_train": last_train,
+            "last_val": last_val,
             "lr": current_lr,
-            "train_rows_per_second": float(len(train_set) / max(epoch_seconds, 1e-6)),
-            "train": train_metrics,
-            "val": val_metrics,
+            "training_sparsity_mode": "batchtopk_train_style",
+            "max_steps": None if max_steps is None else int(max_steps),
         }
-        history.append(record)
+        (out_dir / "train_summary.json").write_text(
+            json.dumps(train_summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
-        if is_main_process():
-            with metrics_jsonl.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-            np.save(
-                out_dir / "feature_frequency_train_last.npy",
-                train_feature_freq.astype(np.float32, copy=False),
-            )
-            np.save(
-                out_dir / "feature_frequency_val_last.npy",
-                val_feature_freq.astype(np.float32, copy=False),
-            )
+    latest_val_metrics = empty_step_metrics()
+    latest_val_feature_freq = np.zeros((int(_unwrap_model(model).d_sae),), dtype=np.float32)
+    completed_epochs = max(0, start_epoch - 1)
+    checkpoints_dir = out_dir / "checkpoints"
 
-            checkpoints_dir = out_dir / "checkpoints"
-            base_model = _unwrap_model(model)
-            ckpt_kwargs = {
-                "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": None if scheduler is None else scheduler.state_dict(),
-                "scaler_state": (
-                    None if scaler is None or not scaler.is_enabled() else scaler.state_dict()
-                ),
-                "rng_state": capture_rng_state(),
-            }
-            save_local_sae_checkpoint(
-                checkpoints_dir / f"ep-{epoch:07d}.pt",
-                model=base_model,
-                config=config,
-                epoch=epoch,
-                step=global_step,
-                best_val_loss=best_val_loss,
-                history=history,
-                **ckpt_kwargs,
+    if max_steps is None:
+        for epoch in range(start_epoch, epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
+
+            epoch_start = time.time()
+            model.train()
+            train_metrics, train_feature_freq, global_step = run_epoch(
+                model=model,
+                backend=backend,
+                loader=train_loader,
+                device=device,
+                precision=precision,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                grad_clip_norm=grad_clip_norm,
+                global_step=global_step,
             )
-            current_val = (
-                float(val_metrics["loss"])
-                if not np.isnan(val_metrics["loss"])
-                else float(train_metrics["loss"])
-            )
-            if best_val_loss is None or current_val < best_val_loss:
-                best_val_loss = current_val
-                best_epoch = epoch
-                save_local_sae_checkpoint(
-                    checkpoints_dir / "best.pt",
-                    model=base_model,
-                    config=config,
-                    epoch=epoch,
-                    step=global_step,
-                    best_val_loss=best_val_loss,
-                    history=history,
-                    **ckpt_kwargs,
-                )
-            (out_dir / "history.json").write_text(
-                json.dumps(history, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            train_summary = {
-                "out_dir": str(out_dir),
-                "backend": str(backend.name),
-                "epochs": int(epochs),
-                "completed_epochs": int(epoch),
+            latest_val_metrics, latest_val_feature_freq = evaluate_current_model()
+
+            epoch_seconds = float(time.time() - epoch_start)
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            record = {
+                "epoch": epoch,
                 "global_step": int(global_step),
-                "seed": int(seed),
-                "stats_dir": None if stats_dir is None else str(stats_dir),
-                "best_epoch": int(best_epoch),
-                "best_val_loss": None if best_val_loss is None else float(best_val_loss),
-                "last_train": train_metrics,
-                "last_val": val_metrics,
+                "epoch_seconds": epoch_seconds,
                 "lr": current_lr,
+                "train_rows_per_second": float(len(train_set) / max(epoch_seconds, 1e-6)),
+                "train": train_metrics,
+                "val": latest_val_metrics,
             }
-            (out_dir / "train_summary.json").write_text(
-                json.dumps(train_summary, indent=2, sort_keys=True),
-                encoding="utf-8",
+            history.append(record)
+            completed_epochs = int(epoch)
+
+            if is_main_process():
+                write_metrics_record(record, write_legacy=True)
+                np.save(
+                    out_dir / "feature_frequency_train_last.npy",
+                    train_feature_freq.astype(np.float32, copy=False),
+                )
+                np.save(
+                    out_dir / "feature_frequency_val_last.npy",
+                    latest_val_feature_freq.astype(np.float32, copy=False),
+                )
+                save_checkpoint_file(checkpoints_dir / f"ep-{epoch:07d}.pt", epoch=epoch)
+                current_val = (
+                    float(latest_val_metrics["loss"])
+                    if not np.isnan(latest_val_metrics["loss"])
+                    else float(train_metrics["loss"])
+                )
+                if best_val_loss is None or current_val < best_val_loss:
+                    best_val_loss = current_val
+                    best_epoch = epoch
+                    save_checkpoint_file(checkpoints_dir / "best.pt", epoch=epoch)
+                (out_dir / "history.json").write_text(
+                    json.dumps(history, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                write_summary(
+                    completed_epochs=completed_epochs,
+                    current_lr=current_lr,
+                    last_train=train_metrics,
+                    last_val=latest_val_metrics,
+                )
+            barrier()
+    else:
+        val_every_steps = max(1, int(train_cfg.get("val_every_steps", max(1, len(train_loader)))))
+        checkpoint_every_steps = max(
+            1,
+            int(train_cfg.get("checkpoint_every_steps", val_every_steps)),
+        )
+        log_every_steps = max(1, int(train_cfg.get("log_every_steps", val_every_steps)))
+        current_epoch = int(start_epoch)
+        steps_in_epoch = 0
+        epoch_start = time.time()
+        model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(current_epoch)
+        train_iter = iter(train_loader)
+        epoch_stats = RunningFeatureStats(
+            d_sae=int(_unwrap_model(model).d_sae),
+            d_model=int(_unwrap_model(model).d_model),
+        )
+        last_train_metrics = empty_step_metrics()
+
+        while global_step < int(max_steps):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                if epoch_stats.total_rows > 0:
+                    epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+                    last_train_metrics = step_metrics_to_dict(epoch_summary)
+                    epoch_seconds = float(time.time() - epoch_start)
+                    current_lr = float(optimizer.param_groups[0]["lr"])
+                    record = {
+                        "epoch": int(current_epoch),
+                        "global_step": int(global_step),
+                        "epoch_seconds": epoch_seconds,
+                        "lr": current_lr,
+                        "train_rows_per_second": float(epoch_stats.total_rows / max(epoch_seconds, 1e-6)),
+                        "train": last_train_metrics,
+                        "val": latest_val_metrics,
+                    }
+                    history.append(record)
+                    completed_epochs = int(current_epoch)
+                    if is_main_process():
+                        write_metrics_record(record, write_legacy=True)
+                        np.save(
+                            out_dir / "feature_frequency_train_last.npy",
+                            train_feature_freq.astype(np.float32, copy=False),
+                        )
+                        (out_dir / "history.json").write_text(
+                            json.dumps(history, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        write_summary(
+                            completed_epochs=completed_epochs,
+                            current_lr=current_lr,
+                            last_train=last_train_metrics,
+                            last_val=latest_val_metrics,
+                        )
+                    barrier()
+                current_epoch += 1
+                steps_in_epoch = 0
+                epoch_start = time.time()
+                epoch_stats = RunningFeatureStats(
+                    d_sae=int(_unwrap_model(model).d_sae),
+                    d_model=int(_unwrap_model(model).d_model),
+                )
+                if train_sampler is not None:
+                    train_sampler.set_epoch(current_epoch)
+                train_iter = iter(train_loader)
+                continue
+
+            x = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            with torch.set_grad_enabled(True):
+                with autocast_context(device, precision):
+                    outputs = backend.forward_loss(
+                        model,
+                        x,
+                        global_step=global_step,
+                        update_state=True,
+                    )
+                for key in ("loss", "recon_mse", "aux_loss"):
+                    value = outputs[key]
+                    if torch.is_tensor(value) and value.ndim > 0:
+                        outputs[key] = value.mean()
+                loss = outputs["loss"]
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                if _unwrap_model(model).decoder_row_norm:
+                    _unwrap_model(model).project_decoder_grad_()
+                if grad_clip_norm is not None and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm))
+                if scaler is not None and scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                if _unwrap_model(model).decoder_row_norm:
+                    _unwrap_model(model).normalize_decoder_rows_()
+
+            epoch_stats.update(
+                batch_size=int(x.shape[0]),
+                loss=outputs["loss"].detach(),
+                recon_mse=outputs["recon_mse"].detach(),
+                aux_loss=outputs["aux_loss"].detach(),
+                target=outputs["target"].detach(),
+                recon=outputs["recon"].detach(),
+                features=outputs["features"],
             )
-        barrier()
+            steps_in_epoch += 1
+
+            should_validate = (global_step % val_every_steps == 0) or (global_step >= int(max_steps))
+            should_checkpoint = (
+                (global_step % checkpoint_every_steps == 0)
+                or (global_step >= int(max_steps))
+            )
+            if global_step % log_every_steps == 0:
+                step_summary, _ = epoch_stats.reduced_summary(device=device)
+                last_train_metrics = step_metrics_to_dict(step_summary)
+                if is_main_process():
+                    write_metrics_record(
+                        {
+                            "kind": "train_step",
+                            "epoch": int(current_epoch),
+                            "global_step": int(global_step),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            "train": last_train_metrics,
+                        }
+                    )
+
+            if should_validate:
+                step_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+                last_train_metrics = step_metrics_to_dict(step_summary)
+                latest_val_metrics, latest_val_feature_freq = evaluate_current_model()
+                if is_main_process():
+                    write_metrics_record(
+                        {
+                            "kind": "val_step",
+                            "epoch": int(current_epoch),
+                            "global_step": int(global_step),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            "train": last_train_metrics,
+                            "val": latest_val_metrics,
+                        }
+                    )
+                    np.save(
+                        out_dir / "feature_frequency_train_last.npy",
+                        train_feature_freq.astype(np.float32, copy=False),
+                    )
+                    np.save(
+                        out_dir / "feature_frequency_val_last.npy",
+                        latest_val_feature_freq.astype(np.float32, copy=False),
+                    )
+                    current_val = (
+                        float(latest_val_metrics["loss"])
+                        if not np.isnan(latest_val_metrics["loss"])
+                        else float(last_train_metrics["loss"])
+                    )
+                    if best_val_loss is None or current_val < best_val_loss:
+                        best_val_loss = current_val
+                        best_epoch = int(current_epoch)
+                        save_checkpoint_file(checkpoints_dir / "best.pt", epoch=current_epoch)
+                    write_summary(
+                        completed_epochs=max(completed_epochs, current_epoch - 1),
+                        current_lr=float(optimizer.param_groups[0]["lr"]),
+                        last_train=last_train_metrics,
+                        last_val=latest_val_metrics,
+                    )
+
+            if should_checkpoint and is_main_process():
+                save_checkpoint_file(
+                    checkpoints_dir / f"step-{int(global_step):07d}.pt",
+                    epoch=current_epoch,
+                )
+                (out_dir / "history.json").write_text(
+                    json.dumps(history, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            if should_validate or should_checkpoint:
+                barrier()
+
+        if epoch_stats.total_rows > 0:
+            epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+            last_train_metrics = step_metrics_to_dict(epoch_summary)
+            epoch_seconds = float(time.time() - epoch_start)
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            record = {
+                "epoch": int(current_epoch),
+                "global_step": int(global_step),
+                "epoch_seconds": epoch_seconds,
+                "lr": current_lr,
+                "train_rows_per_second": float(epoch_stats.total_rows / max(epoch_seconds, 1e-6)),
+                "train": last_train_metrics,
+                "val": latest_val_metrics,
+            }
+            history.append(record)
+            completed_epochs = int(current_epoch)
+            if is_main_process():
+                write_metrics_record(record, write_legacy=True)
+                np.save(
+                    out_dir / "feature_frequency_train_last.npy",
+                    train_feature_freq.astype(np.float32, copy=False),
+                )
+                (out_dir / "history.json").write_text(
+                    json.dumps(history, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                write_summary(
+                    completed_epochs=completed_epochs,
+                    current_lr=current_lr,
+                    last_train=last_train_metrics,
+                    last_val=latest_val_metrics,
+                )
+            barrier()
 
     result = {
         "out_dir": str(out_dir),
         "epochs": int(epochs),
-        "completed_epochs": int(max(0, epochs - start_epoch + 1)),
+        "completed_epochs": int(completed_epochs),
         "global_step": int(global_step),
         "backend": str(backend.name),
         "stats_dir": None if stats_dir is None else str(stats_dir),
+        "max_steps": None if max_steps is None else int(max_steps),
     }
     cleanup_distributed()
     return result

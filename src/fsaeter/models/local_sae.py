@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import pickle
 import warnings
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,20 +42,48 @@ class StepMetrics:
     loss: float
     recon_mse: float
     aux_loss: float
+    mse: float
+    normalized_mse: float
+    zero_baseline_mse: float
+    mean_baseline_mse: float
+    variance_explained: float
     mean_l0: float
+    p50_l0: float
+    p90_l0: float
+    p99_l0: float
     max_l0: int
+    alive_fraction: float
     dead_fraction: float
+    dead_feature_count: int
 
 
 class RunningFeatureStats:
-    def __init__(self, d_sae: int):
+    def __init__(self, d_sae: int, d_model: int):
         self.total_rows = 0
         self.total_loss = 0.0
         self.total_recon_mse = 0.0
         self.total_aux_loss = 0.0
         self.total_l0 = 0.0
         self.max_l0 = 0
+        self.d_model = int(d_model)
         self.feature_counts = torch.zeros(int(d_sae), dtype=torch.float64)
+        self.l0_hist: Counter[int] = Counter()
+        self.sum_sq_error = 0.0
+        self.sum_sq_target = 0.0
+        self.target_sum = torch.zeros(int(d_model), dtype=torch.float64)
+        self.target_sum_sq = torch.zeros(int(d_model), dtype=torch.float64)
+
+    @staticmethod
+    def _quantile_from_histogram(hist: torch.Tensor, quantile: float) -> float:
+        if hist.numel() <= 0:
+            return 0.0
+        total = int(hist.sum().item())
+        if total <= 0:
+            return 0.0
+        target_rank = max(1, int(math.ceil(float(quantile) * total)))
+        cumulative = torch.cumsum(hist.to(dtype=torch.int64), dim=0)
+        index = int(torch.searchsorted(cumulative, torch.tensor(target_rank, dtype=torch.int64)).item())
+        return float(index)
 
     def update(
         self,
@@ -63,6 +92,8 @@ class RunningFeatureStats:
         loss: Tensor,
         recon_mse: Tensor,
         aux_loss: Tensor,
+        target: Tensor,
+        recon: Tensor,
         features,
     ) -> None:
         batch_size = int(batch_size)
@@ -71,38 +102,81 @@ class RunningFeatureStats:
         self.total_recon_mse += float(recon_mse.detach().item()) * batch_size
         self.total_aux_loss += float(aux_loss.detach().item()) * batch_size
 
-        if torch.is_tensor(features):
-            l0 = (features > 0).sum(dim=1)
-            self.total_l0 += float(l0.float().sum().item())
-            self.max_l0 = max(self.max_l0, int(l0.max().item()) if l0.numel() else 0)
-            self.feature_counts += (features > 0).sum(dim=0).detach().cpu().double()
-            return
+        target_detached = target.detach()
+        recon_detached = recon.detach()
+        diff = recon_detached - target_detached
+        self.sum_sq_error += float(diff.pow(2).sum().item())
+        self.sum_sq_target += float(target_detached.pow(2).sum().item())
+        self.target_sum += target_detached.sum(dim=0).detach().cpu().double()
+        self.target_sum_sq += target_detached.pow(2).sum(dim=0).detach().cpu().double()
 
-        if hasattr(features, "row_ids") and hasattr(features, "feature_ids"):
+        if torch.is_tensor(features):
+            row_counts = (features > 0).sum(dim=1).detach().cpu().to(dtype=torch.int64)
+            self.total_l0 += float(row_counts.sum().item())
+            self.max_l0 = max(self.max_l0, int(row_counts.max().item()) if row_counts.numel() else 0)
+            self.feature_counts += (features > 0).sum(dim=0).detach().cpu().double()
+        elif hasattr(features, "row_ids") and hasattr(features, "feature_ids"):
             from fsaeter.train.sparse_ops import sparse_feature_counts
 
             row_counts, feature_counts = sparse_feature_counts(features)
+            row_counts = row_counts.detach().cpu().to(dtype=torch.int64)
             self.total_l0 += float(row_counts.sum().item())
             self.max_l0 = max(
                 self.max_l0,
                 int(row_counts.max().item()) if row_counts.numel() else 0,
             )
             self.feature_counts += feature_counts.detach().cpu().double()
-            return
+        else:
+            raise TypeError(f"Unsupported features payload {type(features).__name__}")
 
-        raise TypeError(f"Unsupported features payload {type(features).__name__}")
+        if row_counts.numel() > 0:
+            values, counts = torch.unique(row_counts, return_counts=True)
+            for value, count in zip(values.tolist(), counts.tolist(), strict=True):
+                self.l0_hist[int(value)] += int(count)
 
     def summary(self) -> StepMetrics:
         if self.total_rows <= 0:
             raise ValueError("No rows were accumulated")
         dead_fraction = float((self.feature_counts == 0).double().mean().item())
+        alive_fraction = 1.0 - dead_fraction
+        dead_feature_count = int((self.feature_counts == 0).sum().item())
+        total_elements = max(1, int(self.total_rows) * int(self.d_model))
+        mse = float(self.sum_sq_error / float(total_elements))
+        zero_baseline_mse = float(self.sum_sq_target / float(total_elements))
+        normalized_mse = float(mse / max(zero_baseline_mse, 1e-12))
+        centered_ss = float(
+            torch.clamp(
+                self.target_sum_sq - (self.target_sum.square() / float(max(1, self.total_rows))),
+                min=0.0,
+            ).sum().item()
+        )
+        mean_baseline_mse = float(centered_ss / float(total_elements))
+        variance_explained = (
+            float(1.0 - (self.sum_sq_error / centered_ss))
+            if centered_ss > 1e-12
+            else 0.0
+        )
+        hist_tensor = torch.zeros((int(self.max_l0) + 1,), dtype=torch.int64)
+        for value, count in self.l0_hist.items():
+            if 0 <= int(value) < hist_tensor.numel():
+                hist_tensor[int(value)] = int(count)
         return StepMetrics(
             loss=self.total_loss / self.total_rows,
             recon_mse=self.total_recon_mse / self.total_rows,
             aux_loss=self.total_aux_loss / self.total_rows,
+            mse=mse,
+            normalized_mse=normalized_mse,
+            zero_baseline_mse=zero_baseline_mse,
+            mean_baseline_mse=mean_baseline_mse,
+            variance_explained=variance_explained,
             mean_l0=self.total_l0 / self.total_rows,
+            p50_l0=self._quantile_from_histogram(hist_tensor, 0.50),
+            p90_l0=self._quantile_from_histogram(hist_tensor, 0.90),
+            p99_l0=self._quantile_from_histogram(hist_tensor, 0.99),
             max_l0=int(self.max_l0),
+            alive_fraction=alive_fraction,
             dead_fraction=dead_fraction,
+            dead_feature_count=dead_feature_count,
         )
 
     def feature_frequency(self) -> np.ndarray:
@@ -120,28 +194,69 @@ class RunningFeatureStats:
                 float(self.total_recon_mse),
                 float(self.total_aux_loss),
                 float(self.total_l0),
+                float(self.sum_sq_error),
+                float(self.sum_sq_target),
             ],
             dtype=torch.float64,
             device=device,
         )
         max_buffer = torch.tensor([int(self.max_l0)], dtype=torch.int64, device=device)
         feature_counts = self.feature_counts.to(device=device)
+        target_sum = self.target_sum.to(device=device)
+        target_sum_sq = self.target_sum_sq.to(device=device)
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(sum_buffer, op=dist.ReduceOp.SUM)
             dist.all_reduce(max_buffer, op=dist.ReduceOp.MAX)
             dist.all_reduce(feature_counts, op=dist.ReduceOp.SUM)
+            dist.all_reduce(target_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(target_sum_sq, op=dist.ReduceOp.SUM)
 
         total_rows = max(1, int(round(float(sum_buffer[0].item()))))
         reduced_counts = feature_counts.cpu()
         dead_fraction = float((reduced_counts == 0).double().mean().item())
+        alive_fraction = 1.0 - dead_fraction
+        dead_feature_count = int((reduced_counts == 0).sum().item())
+        total_elements = max(1, int(total_rows) * int(self.d_model))
+        mse = float(sum_buffer[5].item() / float(total_elements))
+        zero_baseline_mse = float(sum_buffer[6].item() / float(total_elements))
+        normalized_mse = float(mse / max(zero_baseline_mse, 1e-12))
+        centered_ss = float(
+            torch.clamp(
+                target_sum_sq.cpu() - (target_sum.cpu().square() / float(total_rows)),
+                min=0.0,
+            ).sum().item()
+        )
+        mean_baseline_mse = float(centered_ss / float(total_elements))
+        variance_explained = (
+            float(1.0 - (sum_buffer[5].item() / centered_ss))
+            if centered_ss > 1e-12
+            else 0.0
+        )
+        hist_tensor = torch.zeros((int(max_buffer.item()) + 1,), dtype=torch.int64, device=device)
+        for value, count in self.l0_hist.items():
+            if 0 <= int(value) < hist_tensor.numel():
+                hist_tensor[int(value)] = int(count)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(hist_tensor, op=dist.ReduceOp.SUM)
+        hist_cpu = hist_tensor.cpu()
         summary = StepMetrics(
             loss=float(sum_buffer[1].item() / total_rows),
             recon_mse=float(sum_buffer[2].item() / total_rows),
             aux_loss=float(sum_buffer[3].item() / total_rows),
+            mse=mse,
+            normalized_mse=normalized_mse,
+            zero_baseline_mse=zero_baseline_mse,
+            mean_baseline_mse=mean_baseline_mse,
+            variance_explained=variance_explained,
             mean_l0=float(sum_buffer[4].item() / total_rows),
+            p50_l0=self._quantile_from_histogram(hist_cpu, 0.50),
+            p90_l0=self._quantile_from_histogram(hist_cpu, 0.90),
+            p99_l0=self._quantile_from_histogram(hist_cpu, 0.99),
             max_l0=int(max_buffer.item()),
+            alive_fraction=alive_fraction,
             dead_fraction=dead_fraction,
+            dead_feature_count=dead_feature_count,
         )
         feature_frequency = (
             reduced_counts.numpy() / float(total_rows)
@@ -450,6 +565,7 @@ class LocalSparseAutoencoder(torch.nn.Module):
             "features": encoded.f_x,
             "preactivations": encoded.h_x,
             "recon": recon,
+            "target": target,
         }
 
 

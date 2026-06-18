@@ -17,6 +17,36 @@ from fsaeter.utils.config import resolve_path, save_yaml_config
 from fsaeter.utils.repro import resolve_run_seed, seed_everything
 
 
+def write_topk_csr(
+    *,
+    indices: np.ndarray,
+    values: np.ndarray,
+    out_prefix: Path,
+    value_threshold: float,
+) -> dict[str, str]:
+    valid = (
+        (indices >= 0)
+        & np.isfinite(values)
+        & (values > float(value_threshold))
+    )
+    row_counts = valid.sum(axis=1, dtype=np.int64)
+    indptr = np.zeros((indices.shape[0] + 1,), dtype=np.int64)
+    indptr[1:] = np.cumsum(row_counts, dtype=np.int64)
+    csr_indices = indices[valid].astype(np.int32, copy=False)
+    csr_values = values[valid].astype(values.dtype, copy=False)
+    indptr_path = out_prefix.with_name(f"{out_prefix.name}_indptr.npy")
+    indices_path = out_prefix.with_name(f"{out_prefix.name}_indices.npy")
+    values_path = out_prefix.with_name(f"{out_prefix.name}_values.npy")
+    np.save(indptr_path, indptr)
+    np.save(indices_path, csr_indices)
+    np.save(values_path, csr_values)
+    return {
+        "indptr": str(indptr_path),
+        "indices": str(indices_path),
+        "values": str(values_path),
+    }
+
+
 def run_build_h(config: dict, *, base_root: Path) -> dict:
     config = normalize_build_h_config(config)
     run_cfg = dict(config.get("run") or {})
@@ -59,6 +89,9 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     save_topk_mean = bool(build_cfg.get("save_topk_mean", True))
     save_topk_max = bool(build_cfg.get("save_topk_max", True))
     save_sparse_csr_requested = bool(build_cfg.get("save_sparse_csr", False))
+    if save_sparse_csr_requested:
+        save_topk_mean = True
+        save_topk_max = True
     inference_mode = normalize_inference_mode(
         build_cfg.get("inference_mode"),
         default="per_row_topk",
@@ -69,12 +102,6 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     token_batch_size = max(1, int(build_cfg.get("token_batch_size", 2048)))
     precision = str(build_cfg.get("precision", "fp32"))
     h_rows = np.arange(int(max_images), dtype=np.int64)
-
-    if save_sparse_csr_requested:
-        raise NotImplementedError(
-            "build_h.save_sparse_csr=true is not implemented in this tranche. "
-            "Use save_topk_mean/save_topk_max or dense H outputs instead."
-        )
 
     dense_mean = None
     dense_max = None
@@ -200,6 +227,26 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     compat_top_indices.flush()
     compat_top_values.flush()
 
+    csr_paths_mean = None
+    csr_paths_max = None
+    if save_sparse_csr_requested:
+        if mean_top_indices is None or mean_top_values is None:
+            raise RuntimeError("Expected H_mean_top_* arrays to exist before CSR export.")
+        if max_top_indices is None or max_top_values is None:
+            raise RuntimeError("Expected H_max_top_* arrays to exist before CSR export.")
+        csr_paths_mean = write_topk_csr(
+            indices=np.asarray(mean_top_indices),
+            values=np.asarray(mean_top_values),
+            out_prefix=out_dir / "H_mean_csr",
+            value_threshold=active_threshold,
+        )
+        csr_paths_max = write_topk_csr(
+            indices=np.asarray(max_top_indices),
+            values=np.asarray(max_top_values),
+            out_prefix=out_dir / "H_max_csr",
+            value_threshold=active_threshold,
+        )
+
     total_tokens = float(max_images * int(token_info.tokens_per_image))
     image_frequency_mean = (
         image_active_counts_mean / float(max_images)
@@ -238,8 +285,10 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
         "save_topk_mean": bool(save_topk_mean),
         "save_topk_max": bool(save_topk_max),
         "save_sparse_csr_requested": bool(save_sparse_csr_requested),
-        "save_sparse_csr_written": False,
+        "save_sparse_csr_written": bool(csr_paths_mean is not None and csr_paths_max is not None),
         "active_threshold": float(active_threshold),
+        "H_mean_csr": csr_paths_mean,
+        "H_max_csr": csr_paths_max,
     }
     (out_dir / "build_summary.json").write_text(
         json.dumps(build_summary, indent=2, sort_keys=True),
@@ -295,13 +344,15 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             "H_top_values": str(out_dir / "H_top_values.npy"),
             "concept_stats": str(out_dir / "concept_stats.npz"),
             "build_summary": str(out_dir / "build_summary.json"),
+            "H_mean_csr": csr_paths_mean,
+            "H_max_csr": csr_paths_max,
             "image_top_k": int(image_top_k),
             "active_threshold": float(active_threshold),
             "inference_mode": inference_mode,
             "sparse_topk": True,
             "save_dtype": str(save_dtype),
             "save_sparse_csr_requested": bool(save_sparse_csr_requested),
-            "save_sparse_csr_written": False,
+            "save_sparse_csr_written": bool(csr_paths_mean is not None and csr_paths_max is not None),
         },
     }
     with (out_dir / "concept_metadata.json").open("w", encoding="utf-8") as handle:

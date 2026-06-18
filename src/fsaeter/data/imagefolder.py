@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
@@ -77,6 +78,21 @@ class IndexedSubset(Dataset):
         return image, int(label), dataset_idx, path
 
 
+def collate_indexed_subset_batch(batch):
+    images, labels, dataset_indices, paths = zip(*batch)
+    first_image = images[0]
+    if torch.is_tensor(first_image):
+        image_batch = torch.stack(list(images), dim=0)
+    else:
+        image_batch = list(images)
+    return (
+        image_batch,
+        torch.tensor(labels, dtype=torch.int64),
+        torch.tensor(dataset_indices, dtype=torch.int64),
+        list(paths),
+    )
+
+
 @dataclass(frozen=True)
 class ImageRecord:
     row_index: int
@@ -100,13 +116,18 @@ def build_imagefolder_dataset(
         raise FileNotFoundError(f"Dataset split root not found: {split_root}")
 
     image_size = int(data_cfg.get("image_size", 256))
-    transform = transforms.Compose(
-        [
-            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.PILToTensor(),
-        ]
-    )
+    encoder_cfg = dict(config.get("encoder") or {})
+    model_name = str(encoder_cfg.get("model") or encoder_cfg.get("preset") or "")
+    if model_name.startswith("hf:"):
+        transform = None
+    else:
+        transform = transforms.Compose(
+            [
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(image_size),
+                transforms.PILToTensor(),
+            ]
+        )
     dataset = datasets.ImageFolder(str(split_root), transform=transform)
 
     subset_cfg = dict(data_cfg.get("subset") or {})

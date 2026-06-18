@@ -67,6 +67,7 @@ class TorchSparseBackend:
             "features": sparse_features,
             "preactivations": preactivations,
             "recon": recon,
+            "target": target,
         }
 
 
@@ -110,4 +111,5 @@ class TritonSparseBackend:
             "features": sparse_features,
             "preactivations": preactivations,
             "recon": recon,
+            "target": target,
         }

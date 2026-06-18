@@ -80,6 +80,10 @@ def normalize_train_config(config: dict) -> dict:
             "lr_decay",
             "min_lr_fraction",
             "resume_from",
+            "max_steps",
+            "val_every_steps",
+            "checkpoint_every_steps",
+            "log_every_steps",
         ):
             if key in legacy_training and key not in train:
                 train[key] = legacy_training[key]

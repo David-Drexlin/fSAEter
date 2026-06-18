@@ -22,12 +22,14 @@ from fsaeter.data.cache import TokenCacheWriter, build_token_metadata, resolve_t
 from fsaeter.data.imagefolder import (
     IndexedSubset,
     build_imagefolder_dataset,
+    collate_indexed_subset_batch,
     make_image_records,
     summarize_selection,
     write_jsonl,
 )
 from fsaeter.h.build import run_build_h
 from fsaeter.inspect.basic_qc import run_basic_qc
+from fsaeter.inspect.stability import compare_runs, preview_compare_command
 from fsaeter.train.runner import run_training
 from fsaeter.train.stats import compute_token_stats
 from fsaeter.utils.config import (
@@ -85,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--device", default=None)
     p_train.add_argument("--backend", default=None)
     p_train.add_argument("--epochs", type=int, default=None)
+    p_train.add_argument("--max-steps", type=int, default=None)
     p_train.add_argument("--max-train-rows", type=int, default=None)
     p_train.add_argument("--max-val-rows", type=int, default=None)
     p_train.add_argument("--dry-run", action="store_true")
@@ -126,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats.add_argument("--out", default=None)
     p_stats.add_argument("--dry-run", action="store_true")
 
+    p_compare = sub.add_parser(
+        "compare-runs",
+        help="Compare two SAE runs or checkpoints for feature stability.",
+    )
+    p_compare.add_argument("--config", default=None)
+    p_compare.add_argument("--run-a", required=True)
+    p_compare.add_argument("--run-b", required=True)
+    p_compare.add_argument("--concept-dir-a", default=None)
+    p_compare.add_argument("--concept-dir-b", default=None)
+    p_compare.add_argument("--out", default=None)
+    p_compare.add_argument("--dry-run", action="store_true")
+
     return parser
 
 
@@ -141,7 +156,11 @@ def _apply_extract_overrides(config: dict, args: argparse.Namespace) -> dict:
     if args.split is not None:
         config["data"]["split"] = args.split
     if args.encoder is not None:
-        if args.encoder in BACKBONE_PRESETS:
+        if str(args.encoder).startswith("hf:"):
+            config["encoder"]["model"] = str(args.encoder)
+            config["encoder"].pop("name", None)
+            config["encoder"].pop("factory_string", None)
+        elif args.encoder in BACKBONE_PRESETS:
             config["encoder"]["model"] = args.encoder
             config["encoder"].pop("name", None)
             config["encoder"].pop("factory_string", None)
@@ -172,6 +191,8 @@ def _apply_train_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["train"]["backend"] = str(args.backend)
     if args.epochs is not None:
         config["train"]["epochs"] = int(args.epochs)
+    if args.max_steps is not None:
+        config["train"]["max_steps"] = int(args.max_steps)
     if args.max_train_rows is not None:
         config["train"]["max_train_rows"] = int(args.max_train_rows)
     if args.max_val_rows is not None:
@@ -227,6 +248,21 @@ def _apply_inspect_overrides(config: dict, args: argparse.Namespace) -> dict:
     return config
 
 
+def _apply_compare_overrides(config: dict, args: argparse.Namespace) -> dict:
+    config = normalize_build_h_config(config)
+    config.setdefault("compare", {})
+    compare_cfg = config["compare"]
+    compare_cfg["run_a"] = str(args.run_a)
+    compare_cfg["run_b"] = str(args.run_b)
+    if args.concept_dir_a is not None:
+        compare_cfg["concept_dir_a"] = str(args.concept_dir_a)
+    if args.concept_dir_b is not None:
+        compare_cfg["concept_dir_b"] = str(args.concept_dir_b)
+    if args.out is not None:
+        compare_cfg["out_dir"] = str(args.out)
+    return config
+
+
 @torch.no_grad()
 def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) -> dict:
     config = normalize_extract_config(config)
@@ -261,6 +297,7 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         num_workers=int(token_cfg.get("num_workers", 4)),
         pin_memory=device.type == "cuda",
         drop_last=False,
+        collate_fn=collate_indexed_subset_batch,
         generator=build_dataloader_generator(seed),
         worker_init_fn=build_worker_init_fn(seed),
     )
@@ -281,9 +318,11 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
 
     offset = 0
     for images, batch_labels, _dataset_indices, _paths in loader:
-        images = images.to(device=device, dtype=torch.float32, non_blocking=True)
+        model_input = images
+        if torch.is_tensor(images):
+            model_input = images.to(device=device, dtype=torch.float32, non_blocking=True)
         with autocast_context(device, precision):
-            backbone_out = backbone.forward_tokens(images, include_global=include_global)
+            backbone_out = backbone.forward_tokens(model_input, include_global=include_global)
         patch_tokens = backbone_out.patch_tokens.float()
         global_tokens = (
             None
@@ -302,7 +341,7 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
                 global_shape=None if global_tokens is None else global_tokens.shape[1:],
                 save_dtype=save_dtype,
             )
-        batch_size = int(images.shape[0])
+        batch_size = int(batch_labels.shape[0])
         writer.write(patch_tokens, global_tokens)
         labels[offset : offset + batch_size] = batch_labels.numpy().astype(np.int64, copy=False)
         offset += batch_size
@@ -391,6 +430,7 @@ def preview_train_command(config: dict, *, base_root: Path) -> dict:
         "target_k": int(sae_cfg.get("target_k", 0)),
         "d_sae": int(sae_cfg.get("d_sae", 0)),
         "epochs": int(train_cfg.get("epochs", 1)),
+        "max_steps": train_cfg.get("max_steps"),
         "batch_size": int(train_cfg.get("batch_size", 1024)),
         "backend": str(train_cfg.get("backend", "torch_sparse")),
         "max_train_rows": train_cfg.get("max_train_rows"),
@@ -438,9 +478,13 @@ def preview_stats_command(config: dict, *, base_root: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config_path = Path(args.config).expanduser()
-    config = load_yaml_config(config_path)
-    base_root = runtime_base_root(config_path)
+    if getattr(args, "config", None) is not None:
+        config_path = Path(args.config).expanduser()
+        config = load_yaml_config(config_path)
+        base_root = runtime_base_root(config_path)
+    else:
+        config = {}
+        base_root = Path.cwd().resolve()
 
     if args.command == "extract-tokens":
         payload = run_extract_tokens(
@@ -472,6 +516,12 @@ def main(argv: list[str] | None = None) -> int:
             base_root=base_root,
             dry_run=bool(args.dry_run),
         )
+    elif args.command == "compare-runs":
+        normalized = _apply_compare_overrides(config, args)
+        if args.dry_run:
+            payload = preview_compare_command(normalized, base_root=base_root)
+        else:
+            payload = compare_runs(normalized, base_root=base_root)
     else:
         raise ValueError(f"Unknown command {args.command!r}")
 

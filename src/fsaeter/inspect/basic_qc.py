@@ -523,6 +523,39 @@ def load_train_summary(checkpoint_path: str | Path) -> dict | None:
     return None
 
 
+def extract_reconstruction_metrics(train_summary: dict | None) -> dict[str, dict] | None:
+    if not isinstance(train_summary, dict):
+        return None
+    extracted: dict[str, dict] = {}
+    for split in ("last_train", "last_val"):
+        payload = train_summary.get(split)
+        if not isinstance(payload, dict):
+            continue
+        extracted[split] = {
+            key: payload.get(key)
+            for key in (
+                "loss",
+                "recon_mse",
+                "aux_loss",
+                "mse",
+                "normalized_mse",
+                "zero_baseline_mse",
+                "mean_baseline_mse",
+                "variance_explained",
+                "mean_l0",
+                "p50_l0",
+                "p90_l0",
+                "p99_l0",
+                "max_l0",
+                "alive_fraction",
+                "dead_fraction",
+                "dead_feature_count",
+            )
+            if key in payload
+        }
+    return extracted or None
+
+
 def load_build_summary(concept_dir: Path) -> dict | None:
     summary_path = concept_dir / "build_summary.json"
     if summary_path.exists():
@@ -774,6 +807,7 @@ def run_basic_qc(
         "miners": normalized_miners,
         "token_frequency_mean": float(np.asarray(token_frequency, dtype=np.float64).mean()),
         "train_summary": train_summary,
+        "reconstruction_metrics": extract_reconstruction_metrics(train_summary),
         "build_summary": build_summary,
         "previews": {
             "images_written": 0,

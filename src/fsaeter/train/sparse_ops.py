@@ -27,7 +27,7 @@ class SparseActs:
             dtype=self.values.dtype,
         )
         if self.nnz > 0:
-            dense[self.row_ids, self.feature_ids] = self.values
+            dense.index_put_((self.row_ids, self.feature_ids), self.values, accumulate=True)
         return dense
 
 

@@ -54,6 +54,74 @@ if TRITON_AVAILABLE:  # pragma: no branch
         out_ptrs = out_ptr + row_ids[:, None] * stride_o0 + d_offsets[None, :] * stride_o1
         tl.atomic_add(out_ptrs, contrib, mask=nnz_mask[:, None] & d_mask[None, :])
 
+    @triton.jit
+    def _sparse_decode_backward_values_kernel(
+        row_ids_ptr,
+        feature_ids_ptr,
+        grad_output_ptr,
+        w_dec_ptr,
+        grad_values_ptr,
+        nnz,
+        d_model,
+        stride_go0,
+        stride_go1,
+        stride_w0,
+        stride_w1,
+        BLOCK_NNZ: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_nnz = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        nnz_offsets = pid_nnz * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        nnz_mask = nnz_offsets < nnz
+        d_mask = d_offsets < d_model
+
+        row_ids = tl.load(row_ids_ptr + nnz_offsets, mask=nnz_mask, other=0).to(tl.int32)
+        feature_ids = tl.load(feature_ids_ptr + nnz_offsets, mask=nnz_mask, other=0).to(tl.int32)
+        grad_ptrs = (
+            grad_output_ptr + row_ids[:, None] * stride_go0 + d_offsets[None, :] * stride_go1
+        )
+        weight_ptrs = w_dec_ptr + feature_ids[:, None] * stride_w0 + d_offsets[None, :] * stride_w1
+        grad_block = tl.load(grad_ptrs, mask=nnz_mask[:, None] & d_mask[None, :], other=0.0)
+        weight_block = tl.load(weight_ptrs, mask=nnz_mask[:, None] & d_mask[None, :], other=0.0)
+        partial = tl.sum(grad_block * weight_block, axis=1)
+        tl.atomic_add(grad_values_ptr + nnz_offsets, partial, mask=nnz_mask)
+
+    @triton.jit
+    def _sparse_decode_backward_wdec_kernel(
+        row_ids_ptr,
+        feature_ids_ptr,
+        values_ptr,
+        grad_output_ptr,
+        grad_w_ptr,
+        nnz,
+        d_model,
+        stride_go0,
+        stride_go1,
+        stride_gw0,
+        stride_gw1,
+        BLOCK_NNZ: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_nnz = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        nnz_offsets = pid_nnz * BLOCK_NNZ + tl.arange(0, BLOCK_NNZ)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        nnz_mask = nnz_offsets < nnz
+        d_mask = d_offsets < d_model
+
+        row_ids = tl.load(row_ids_ptr + nnz_offsets, mask=nnz_mask, other=0).to(tl.int32)
+        feature_ids = tl.load(feature_ids_ptr + nnz_offsets, mask=nnz_mask, other=0).to(tl.int32)
+        values = tl.load(values_ptr + nnz_offsets, mask=nnz_mask, other=0.0)
+        grad_ptrs = (
+            grad_output_ptr + row_ids[:, None] * stride_go0 + d_offsets[None, :] * stride_go1
+        )
+        grad_block = tl.load(grad_ptrs, mask=nnz_mask[:, None] & d_mask[None, :], other=0.0)
+        contrib = grad_block * values[:, None]
+        grad_w_ptrs = grad_w_ptr + feature_ids[:, None] * stride_gw0 + d_offsets[None, :] * stride_gw1
+        tl.atomic_add(grad_w_ptrs, contrib, mask=nnz_mask[:, None] & d_mask[None, :])
+
 
 def require_triton() -> None:
     if not TRITON_AVAILABLE:
@@ -100,6 +168,71 @@ def sparse_decode_triton(acts: SparseActs, W_dec: Tensor, b_dec: Tensor) -> Tens
     return out + b_dec
 
 
+def sparse_decode_backward_values_triton(
+    row_ids: Tensor,
+    feature_ids: Tensor,
+    grad_output: Tensor,
+    W_dec: Tensor,
+) -> Tensor:
+    require_triton()
+    if row_ids.numel() == 0:
+        return torch.empty((0,), device=grad_output.device, dtype=grad_output.dtype)
+    grad_values = torch.zeros((int(row_ids.numel()),), device=grad_output.device, dtype=grad_output.dtype)
+    grid = (
+        triton.cdiv(int(row_ids.numel()), 64),
+        triton.cdiv(int(W_dec.shape[1]), 64),
+    )
+    _sparse_decode_backward_values_kernel[grid](
+        row_ids.to(device=grad_output.device, dtype=torch.int32),
+        feature_ids.to(device=grad_output.device, dtype=torch.int32),
+        grad_output.contiguous(),
+        W_dec.contiguous(),
+        grad_values,
+        int(row_ids.numel()),
+        int(W_dec.shape[1]),
+        grad_output.stride(0),
+        grad_output.stride(1),
+        W_dec.stride(0),
+        W_dec.stride(1),
+        BLOCK_NNZ=64,
+        BLOCK_D=64,
+    )
+    return grad_values
+
+
+def sparse_decode_backward_wdec_triton(
+    row_ids: Tensor,
+    feature_ids: Tensor,
+    values: Tensor,
+    grad_output: Tensor,
+    w_shape: tuple[int, int],
+) -> Tensor:
+    require_triton()
+    grad_w = torch.zeros(w_shape, device=grad_output.device, dtype=grad_output.dtype)
+    if row_ids.numel() == 0:
+        return grad_w
+    grid = (
+        triton.cdiv(int(row_ids.numel()), 64),
+        triton.cdiv(int(w_shape[1]), 64),
+    )
+    _sparse_decode_backward_wdec_kernel[grid](
+        row_ids.to(device=grad_output.device, dtype=torch.int32),
+        feature_ids.to(device=grad_output.device, dtype=torch.int32),
+        values.to(device=grad_output.device, dtype=grad_output.dtype),
+        grad_output.contiguous(),
+        grad_w,
+        int(row_ids.numel()),
+        int(w_shape[1]),
+        grad_output.stride(0),
+        grad_output.stride(1),
+        grad_w.stride(0),
+        grad_w.stride(1),
+        BLOCK_NNZ=64,
+        BLOCK_D=64,
+    )
+    return grad_w
+
+
 class _SparseDecodeTritonFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -134,12 +267,22 @@ class _SparseDecodeTritonFn(torch.autograd.Function):
 
         grad_values = None
         if ctx.needs_input_grad[2]:
-            grad_values = (grad_output[row_ids] * W_dec[feature_ids]).sum(dim=1)
+            grad_values = sparse_decode_backward_values_triton(
+                row_ids,
+                feature_ids,
+                grad_output,
+                W_dec,
+            )
 
         grad_w_dec = None
         if ctx.needs_input_grad[3]:
-            grad_w_dec = torch.zeros_like(W_dec)
-            grad_w_dec.index_add_(0, feature_ids, values[:, None] * grad_output[row_ids])
+            grad_w_dec = sparse_decode_backward_wdec_triton(
+                row_ids,
+                feature_ids,
+                values,
+                grad_output,
+                (int(W_dec.shape[0]), int(W_dec.shape[1])),
+            ).to(dtype=W_dec.dtype)
 
         grad_b_dec = None
         if ctx.needs_input_grad[4]:
