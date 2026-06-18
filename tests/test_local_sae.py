@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from collections import Counter
+import json
 from pathlib import Path
 import socket
 import warnings

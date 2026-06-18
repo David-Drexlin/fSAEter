@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import math
-import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 import pickle
 from typing import NamedTuple
+import warnings
 
 import numpy as np
 import torch
-from torch import Tensor
 import torch.distributed as dist
+from torch import Tensor
 
 
 class SaeEncodeOutput(NamedTuple):

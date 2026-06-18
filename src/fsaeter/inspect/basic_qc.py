@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 import json
 import math
-from collections.abc import Iterable, Sequence
-from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np

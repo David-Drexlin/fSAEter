@@ -1,7 +1,5 @@
 """Module entrypoint for ``python -m fsaeter``."""
 
-from __future__ import annotations
-
 from fsaeter.cli import main
 
 
