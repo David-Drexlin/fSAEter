@@ -1,0 +1,28 @@
+run:
+  name: in100_dinov2b_reg_tokens_10k
+  seed: 0
+  out_dir: outputs/in100_dinov2b_reg_tokens_10k
+
+data:
+  root: /path/to/imagenet100
+  split: train
+  image_size: 256
+  subset:
+    max_images: 10000
+    strategy: stratified
+    seed: 0
+
+encoder:
+  model: dinov2-b-reg
+  resolution: 256
+  include_global: true
+  l2_normalize_tokens: false
+  l2_normalize_global: false
+  token_normalization: encoder_norm_no_l2
+
+tokens:
+  device: auto
+  precision: fp32
+  batch_size: 32
+  num_workers: 8
+  save_dtype: float16

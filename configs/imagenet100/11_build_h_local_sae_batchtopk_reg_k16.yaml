@@ -1,0 +1,31 @@
+run:
+  name: in100_reg_local_sae_batchtopk_k16_h
+  out_dir: outputs/local_sae/in100_reg_batchtopk_k16/H
+
+tokens:
+  cache_dir: outputs/in100_dinov2b_reg_tokens_10k/tokens
+
+sae:
+  checkpoint: outputs/local_sae/in100_reg_batchtopk_k16/checkpoints/best.pt
+
+build_h:
+  device: auto
+  precision: bf16
+  image_batch_size: 16
+  token_batch_size: 4096
+  image_top_k: 64
+  active_threshold: 1.0e-06
+  save_max: true
+  save_dtype: float16
+
+inspect:
+  device: auto
+  precision: fp32
+  min_support: 32
+  min_class_coverage: 6
+  min_per_class: 2
+  top_candidate_count: 40
+  preview_concepts: 10
+  preview_images_per_concept: 8
+  preview_score_mode: max
+
