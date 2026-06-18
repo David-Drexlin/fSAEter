@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from fsaeter.backbones import LocalBackbone
+from fsaeter.backbones import BACKBONE_PRESETS, LocalBackbone
 from fsaeter.config_compat import (
     normalize_build_h_config,
     normalize_extract_config,
@@ -34,6 +34,12 @@ from fsaeter.utils.config import (
     resolve_path,
     runtime_base_root,
     save_yaml_config,
+)
+from fsaeter.utils.repro import (
+    build_dataloader_generator,
+    build_worker_init_fn,
+    resolve_run_seed,
+    seed_everything,
 )
 from fsaeter.utils.distributed import is_distributed, is_main_process
 
@@ -122,7 +128,13 @@ def _apply_extract_overrides(config: dict, args: argparse.Namespace) -> dict:
     if args.split is not None:
         config["data"]["split"] = args.split
     if args.encoder is not None:
-        config["encoder"]["name"] = args.encoder
+        if args.encoder in BACKBONE_PRESETS:
+            config["encoder"]["model"] = args.encoder
+            config["encoder"].pop("name", None)
+            config["encoder"].pop("factory_string", None)
+        else:
+            config["encoder"]["factory_string"] = args.encoder
+            config["encoder"].pop("name", None)
     if args.batch_size is not None:
         config["tokens"]["batch_size"] = int(args.batch_size)
     if args.out is not None:
@@ -191,6 +203,8 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
     data_cfg = dict(config.get("data") or {})
     token_cfg = dict(config.get("tokens") or {})
     encoder_cfg = dict(config.get("encoder") or {})
+    seed = resolve_run_seed(config)
+    seed_everything(seed)
 
     out_dir = resolve_path(run_cfg.get("out_dir", "outputs/tokens"), base=base_root)
     tokens_dir = out_dir / "tokens"
@@ -216,6 +230,8 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         num_workers=int(token_cfg.get("num_workers", 4)),
         pin_memory=device.type == "cuda",
         drop_last=False,
+        generator=build_dataloader_generator(seed),
+        worker_init_fn=build_worker_init_fn(seed),
     )
 
     include_global = bool(encoder_cfg.get("include_global", True))
@@ -229,6 +245,7 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         dataset,
         selected_indices,
         data_root=resolve_path(data_cfg["root"], base=base_root),
+        write_absolute_paths=bool(data_cfg.get("write_absolute_paths", False)),
     )
 
     offset = 0
@@ -289,10 +306,17 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
     run_cfg = dict(config.get("run") or {})
     tokens_cfg = dict(config.get("tokens") or {})
     sae_cfg = dict(config.get("sae") or {})
+    data_cfg = dict(config.get("data") or {})
     inspect_cfg = dict(config.get("inspect") or {})
+    seed_everything(resolve_run_seed(config))
     concept_dir = resolve_path(run_cfg.get("out_dir", "outputs/local_sae_h"), base=base_root)
     tokens_dir = resolve_path(tokens_cfg.get("cache_dir", ""), base=base_root)
     checkpoint_path = resolve_path(sae_cfg.get("checkpoint", ""), base=base_root)
+    data_root = (
+        resolve_path(data_cfg.get("root", ""), base=base_root)
+        if data_cfg.get("root")
+        else None
+    )
     device = get_device(inspect_cfg.get("device", "auto"))
     if dry_run:
         return {
@@ -313,6 +337,7 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
         min_class_coverage=int(inspect_cfg.get("min_class_coverage", 8)),
         min_per_class=int(inspect_cfg.get("min_per_class", 4)),
         top_candidate_count=int(inspect_cfg.get("top_candidate_count", 50)),
+        data_root=data_root,
     )
     return {"concept_dir": str(concept_dir), "qc": qc}
 

@@ -9,8 +9,8 @@
 
 It intentionally does **not** include:
 
-- task-specific generative or augmentation consumers
-- private downstream experiment stacks
+- downstream task integrations
+- application-specific consumers
 - pretrained public SAE checkpoint loaders that require `saev`, `overcomplete`, or custom HF runtime stacks
 
 ## Architecture

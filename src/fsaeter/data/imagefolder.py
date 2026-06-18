@@ -81,7 +81,7 @@ class IndexedSubset(Dataset):
 class ImageRecord:
     row_index: int
     dataset_index: int
-    path: str
+    path: str | None
     relative_path: str
     class_index: int
     class_name: str
@@ -127,6 +127,7 @@ def make_image_records(
     selected_indices: Sequence[int],
     *,
     data_root: Path,
+    write_absolute_paths: bool = False,
 ) -> list[ImageRecord]:
     records: list[ImageRecord] = []
     idx_to_class = {idx: name for name, idx in dataset.class_to_idx.items()}
@@ -141,7 +142,7 @@ def make_image_records(
             ImageRecord(
                 row_index=row_idx,
                 dataset_index=int(dataset_idx),
-                path=str(path_obj),
+                path=str(path_obj) if write_absolute_paths else None,
                 relative_path=rel_path,
                 class_index=int(label),
                 class_name=idx_to_class[int(label)],

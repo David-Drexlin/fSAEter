@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import pickle
 from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch import Tensor
+import torch.distributed as dist
 
 
 class SaeEncodeOutput(NamedTuple):
@@ -84,6 +87,49 @@ class RunningFeatureStats:
     def feature_frequency(self) -> np.ndarray:
         denom = max(1, self.total_rows)
         return (self.feature_counts.numpy() / float(denom)).astype(np.float32, copy=False)
+
+    def reduced_summary(self, *, device: torch.device) -> tuple[StepMetrics, np.ndarray]:
+        if self.total_rows <= 0:
+            raise ValueError("No rows were accumulated")
+
+        sum_buffer = torch.tensor(
+            [
+                float(self.total_rows),
+                float(self.total_loss),
+                float(self.total_recon_mse),
+                float(self.total_aux_loss),
+                float(self.total_l0),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        max_buffer = torch.tensor(
+            [int(self.max_l0)],
+            dtype=torch.int64,
+            device=device,
+        )
+        feature_counts = self.feature_counts.to(device=device)
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(sum_buffer, op=dist.ReduceOp.SUM)
+            dist.all_reduce(max_buffer, op=dist.ReduceOp.MAX)
+            dist.all_reduce(feature_counts, op=dist.ReduceOp.SUM)
+
+        total_rows = max(1, int(round(float(sum_buffer[0].item()))))
+        reduced_counts = feature_counts.cpu()
+        dead_fraction = float((reduced_counts == 0).double().mean().item())
+        summary = StepMetrics(
+            loss=float(sum_buffer[1].item() / total_rows),
+            recon_mse=float(sum_buffer[2].item() / total_rows),
+            aux_loss=float(sum_buffer[3].item() / total_rows),
+            mean_l0=float(sum_buffer[4].item() / total_rows),
+            max_l0=int(max_buffer.item()),
+            dead_fraction=dead_fraction,
+        )
+        feature_frequency = (
+            reduced_counts.numpy() / float(total_rows)
+        ).astype(np.float32, copy=False)
+        return summary, feature_frequency
 
 
 class LocalSparseAutoencoder(torch.nn.Module):
@@ -254,7 +300,20 @@ def load_local_sae_checkpoint(
     device: torch.device | str = "cpu",
 ) -> tuple[LocalSparseAutoencoder, dict]:
     path = Path(checkpoint_path).expanduser().resolve()
-    payload = torch.load(path, map_location=device)
+    try:
+        payload = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
+    except (pickle.UnpicklingError, RuntimeError, ValueError) as exc:
+        warnings.warn(
+            (
+                "Falling back to legacy torch.load for checkpoint compatibility; "
+                f"safe weights-only loading failed for {path}: {exc}"
+            ),
+            UserWarning,
+            stacklevel=2,
+        )
+        payload = torch.load(path, map_location=device)
     config = dict(payload.get("config") or {})
     model = build_local_sae(config).to(device)
     model.load_state_dict(payload["state_dict"])

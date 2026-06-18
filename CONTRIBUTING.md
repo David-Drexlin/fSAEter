@@ -20,6 +20,6 @@ pytest
 ## Scope guardrails
 
 - Keep this repo focused on token extraction, local SAE training, `H` construction, and lightweight inspection.
-- Do not add task-specific generator or augmentation stacks here.
+- Do not add downstream task integrations here.
 - Keep backbone loading explicit and generic; avoid baking in lab-specific repo assumptions.
 - Treat third-party repos as references, not runtime dependencies, unless a future design pass intentionally changes that.

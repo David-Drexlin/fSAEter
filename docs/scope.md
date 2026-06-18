@@ -9,8 +9,8 @@ This repository is intentionally scoped to the **public core** of the concept pi
 
 Out of scope here:
 
-- task-specific generator or augmentation consumers
-- information-centric target selection tied to private downstream workflows
+- downstream task integrations
+- information-centric target selection tied to application-specific workflows
 - private classifier or end-task evaluation stacks
 - dependency-heavy pretrained SAE checkpoint loaders
 

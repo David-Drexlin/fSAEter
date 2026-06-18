@@ -23,6 +23,12 @@ from fsaeter.models.local_sae import (
     save_local_sae_checkpoint,
 )
 from fsaeter.utils.config import resolve_path, save_yaml_config
+from fsaeter.utils.repro import (
+    build_dataloader_generator,
+    build_worker_init_fn,
+    resolve_run_seed,
+    seed_everything,
+)
 from fsaeter.utils.distributed import (
     barrier,
     cleanup_distributed,
@@ -105,15 +111,15 @@ def run_epoch(
             features=outputs["features"].detach(),
         )
 
-    summary = stats.summary()
+    reduced_summary, feature_frequency = stats.reduced_summary(device=device)
     return {
-        "loss": float(summary.loss),
-        "recon_mse": float(summary.recon_mse),
-        "aux_loss": float(summary.aux_loss),
-        "mean_l0": float(summary.mean_l0),
-        "max_l0": int(summary.max_l0),
-        "dead_fraction": float(summary.dead_fraction),
-    }, stats.feature_frequency()
+        "loss": float(reduced_summary.loss),
+        "recon_mse": float(reduced_summary.recon_mse),
+        "aux_loss": float(reduced_summary.aux_loss),
+        "mean_l0": float(reduced_summary.mean_l0),
+        "max_l0": int(reduced_summary.max_l0),
+        "dead_fraction": float(reduced_summary.dead_fraction),
+    }, feature_frequency
 
 
 def run_training(config: dict, *, base_root: Path) -> dict:
@@ -122,11 +128,13 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     tokens_cfg = dict(config.get("tokens") or {})
     sae_cfg = dict(config.get("sae") or {})
     train_cfg = dict(config.get("train") or {})
+    seed = resolve_run_seed(config)
 
     device = get_device(train_cfg)
     init_distributed(device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
+    seed_everything(seed)
 
     tokens_dir = resolve_path(tokens_cfg.get("cache_dir", ""), base=base_root)
     token_info = resolve_token_cache_info(tokens_dir)
@@ -201,6 +209,8 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
+        generator=build_dataloader_generator(seed, rank_offset=dist_rank),
+        worker_init_fn=build_worker_init_fn(seed, rank_offset=dist_rank),
     )
     val_loader = DataLoader(
         val_set,
@@ -210,6 +220,8 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
+        generator=build_dataloader_generator(seed + 1, rank_offset=dist_rank),
+        worker_init_fn=build_worker_init_fn(seed + 1, rank_offset=dist_rank),
     )
 
     model = build_local_sae(config).to(device)

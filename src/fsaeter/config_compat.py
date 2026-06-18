@@ -94,6 +94,7 @@ def normalize_train_config(config: dict) -> dict:
 def normalize_build_h_config(config: dict) -> dict:
     cfg = deepcopy(config)
     run = dict(cfg.get("run") or {})
+    data = dict(cfg.get("data") or {})
     tokens = dict(cfg.get("tokens") or {})
     sae = dict(cfg.get("sae") or {})
     build_h = dict(cfg.get("build_h") or {})
@@ -115,6 +116,7 @@ def normalize_build_h_config(config: dict) -> dict:
 
     return {
         "run": run,
+        "data": data,
         "tokens": tokens,
         "sae": sae,
         "build_h": build_h,

@@ -14,6 +14,7 @@ from fsaeter.h.helpers import pool_sae_image_batch
 from fsaeter.inspect.basic_qc import select_sparse_topk_rows
 from fsaeter.models.local_sae import load_local_sae_checkpoint, payload_to_local_sae_info
 from fsaeter.utils.config import resolve_path, save_yaml_config
+from fsaeter.utils.repro import resolve_run_seed, seed_everything
 
 
 def run_build_h(config: dict, *, base_root: Path) -> dict:
@@ -22,6 +23,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     tokens_cfg = dict(config.get("tokens") or {})
     sae_cfg = dict(config.get("sae") or {})
     build_cfg = dict(config.get("build_h") or {})
+    seed_everything(resolve_run_seed(config))
 
     tokens_dir = resolve_path(tokens_cfg.get("cache_dir", ""), base=base_root)
     token_info = resolve_token_cache_info(tokens_dir)
@@ -163,6 +165,9 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             "metadata": token_info.metadata_path,
             "labels": token_info.labels_path,
             "encoder_name": token_info.encoder_name,
+            "encoder_model": token_info.encoder_model,
+            "encoder_factory_string": token_info.encoder_factory_string,
+            "path_mode": token_info.path_mode,
             "token_shape": [int(max_images), int(token_info.tokens_per_image), int(token_info.d_model)],
             "patch_grid": [int(v) for v in token_info.patch_grid],
             "encoder_input_size": int(token_info.encoder_input_size),

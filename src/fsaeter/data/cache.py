@@ -27,6 +27,9 @@ class TokenCacheInfo:
     data_image_size: int
     num_register_tokens: int
     encoder_name: str | None = None
+    encoder_model: str | None = None
+    encoder_factory_string: str | None = None
+    path_mode: str = "relative_only"
 
 
 def resolve_token_cache_info(tokens_dir: str | Path) -> TokenCacheInfo:
@@ -61,6 +64,9 @@ def resolve_token_cache_info(tokens_dir: str | Path) -> TokenCacheInfo:
         data_image_size=int(metadata.get("data_image_size", 256)),
         num_register_tokens=int(metadata.get("num_register_tokens", 0)),
         encoder_name=metadata.get("encoder_name"),
+        encoder_model=metadata.get("encoder_model"),
+        encoder_factory_string=metadata.get("encoder_factory_string"),
+        path_mode=str(metadata.get("path_mode", "relative_only")),
     )
 
 
@@ -157,7 +163,9 @@ def build_token_metadata(
         global_token_order = ["cls"] + [f"reg_{idx}" for idx in range(num_register_tokens)]
 
     return {
-        "encoder_name": encoder_cfg.get("name"),
+        "encoder_name": getattr(encoder, "encoder_name", None),
+        "encoder_model": getattr(encoder, "encoder_model", None),
+        "encoder_factory_string": getattr(encoder, "encoder_factory_string", None),
         "token_shape": [int(num_images), *[int(v) for v in patch_shape]],
         "global_token_shape": (
             None
@@ -169,13 +177,18 @@ def build_token_metadata(
         "embedding_dim": int(patch_shape[1]),
         "data_image_size": int(data_cfg.get("image_size", resolution)),
         "encoder_resolution": int(resolution),
-        "encoder_input_size": int(224 * (resolution // 256)),
+        "encoder_input_size": int(data_cfg.get("image_size", resolution)),
         "patch_size": patch_size,
         "patch_grid": [patch_grid, patch_grid],
         "normalization": encoder_cfg.get("token_normalization", "encoder_norm_l2_optional"),
         "include_global": global_shape is not None,
         "global_token_order": global_token_order,
         "num_register_tokens": num_register_tokens,
+        "path_mode": (
+            "absolute_and_relative"
+            if bool(data_cfg.get("write_absolute_paths", False))
+            else "relative_only"
+        ),
         "save_dtype": str(np.dtype(tokens_cfg.get("save_dtype", "float16"))),
         "output_dir": str(output_dir),
         "class_counts": {str(k): int(v) for k, v in sorted(class_counts.items())},

@@ -317,6 +317,22 @@ def save_preview_image(image_path: str, *, output_path: Path, target_size: int) 
     return preview
 
 
+def resolve_preview_source_path(
+    record: ImageRecordLite,
+    *,
+    data_root: Path | None,
+) -> Path | None:
+    if record.path:
+        candidate = Path(record.path).expanduser()
+        if candidate.is_file():
+            return candidate
+    if data_root is not None and record.relative_path:
+        candidate = (data_root / record.relative_path).expanduser()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def crop_patch(
     preview: Image.Image,
     *,
@@ -351,9 +367,11 @@ def run_basic_qc(
     min_class_coverage: int = 8,
     min_per_class: int = 4,
     top_candidate_count: int = 50,
+    data_root: str | Path | None = None,
 ) -> dict:
     concept_dir = Path(concept_dir).expanduser().resolve()
     tokens_dir = Path(tokens_dir).expanduser().resolve()
+    resolved_data_root = None if data_root is None else Path(data_root).expanduser().resolve()
     token_info = resolve_token_cache_info(tokens_dir)
 
     top_indices_arr = np.load(concept_dir / "H_top_indices.npy", mmap_mode="r")
@@ -400,6 +418,12 @@ def run_basic_qc(
         "feature_image_frequency": summarize_feature_frequency(image_frequency),
         "num_candidates": int(len(candidates)),
         "active_threshold": float(active_threshold),
+        "previews": {
+            "images_written": 0,
+            "images_skipped_missing_source": 0,
+            "patches_written": 0,
+            "patches_skipped_missing_source": 0,
+        },
     }
     write_json(concept_dir / "qc_summary.json", qc_summary)
 
@@ -470,19 +494,24 @@ def run_basic_qc(
         for local_idx, image_row in enumerate(unique_rows.tolist()):
             record = records[int(image_row)]
             preview = None
-            if record.path:
+            source_path = resolve_preview_source_path(record, data_root=resolved_data_root)
+            if source_path is not None:
                 preview_path = concept_dir / "top_images" / f"image_{int(image_row):06d}.png"
                 preview = save_preview_image(
-                    record.path,
+                    str(source_path),
                     output_path=preview_path,
                     target_size=preview_png_size,
                 )
+                qc_summary["previews"]["images_written"] += 1
+            else:
+                qc_summary["previews"]["images_skipped_missing_source"] += 1
             for concept_id in per_image_concepts[int(image_row)]:
                 column = acts[local_idx, :, int(concept_id)]
                 patch_index = int(column.argmax().item())
                 patch_score = float(column[patch_index].item())
                 patch_row = patch_col = -1
                 patch_png = None
+                image_png = None
                 if preview is not None:
                     rank = concept_to_rank[(int(concept_id), int(image_row))]
                     patch_png = (
@@ -497,6 +526,12 @@ def run_basic_qc(
                         patch_grid=token_info.patch_grid,
                         output_path=patch_png,
                     )
+                    image_png = str(
+                        concept_dir / "top_images" / f"image_{int(image_row):06d}.png"
+                    )
+                    qc_summary["previews"]["patches_written"] += 1
+                else:
+                    qc_summary["previews"]["patches_skipped_missing_source"] += 1
                 patch_rows_payload.append(
                     {
                         "concept_id": int(concept_id),
@@ -507,9 +542,7 @@ def run_basic_qc(
                         "patch_col": patch_col,
                         "score": patch_score,
                         "patch_png": None if patch_png is None else str(patch_png),
-                        "image_png": str(
-                            concept_dir / "top_images" / f"image_{int(image_row):06d}.png"
-                        ),
+                        "image_png": image_png,
                         "path": record.path,
                         "relative_path": record.relative_path,
                         "class_index": (
@@ -538,4 +571,5 @@ def run_basic_qc(
         **qc_summary,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    write_json(concept_dir / "qc_summary.json", qc_summary)
     return qc_summary

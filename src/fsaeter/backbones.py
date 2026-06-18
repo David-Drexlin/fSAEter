@@ -81,6 +81,9 @@ class LocalBackbone:
         self.patch_size = int(getattr(self._encoder, "patch_size", 14))
         self.num_register_tokens = int(getattr(self._encoder, "num_register_tokens", 0))
         self.encoder_name = encoder_name
+        self.encoder_model = encoder_cfg.get("model") or encoder_cfg.get("preset")
+        self.encoder_factory_string = encoder_name
+        self.encoder_resolution = resolution
 
     def eval(self) -> LocalBackbone:
         self._encoder.eval()
