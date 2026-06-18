@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable, Sequence
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
 
 import numpy as np
 import torch
@@ -46,11 +46,23 @@ def load_image_records(path: str | Path) -> list[ImageRecordLite]:
         records.append(
             ImageRecordLite(
                 row_index=int(row.get("row_index", len(records))),
-                dataset_index=int(row["dataset_index"]) if row.get("dataset_index") is not None else None,
-                class_index=int(row["class_index"]) if row.get("class_index") is not None else None,
+                dataset_index=(
+                    int(row["dataset_index"])
+                    if row.get("dataset_index") is not None
+                    else None
+                ),
+                class_index=(
+                    int(row["class_index"])
+                    if row.get("class_index") is not None
+                    else None
+                ),
                 class_name=str(row["class_name"]) if row.get("class_name") is not None else None,
                 path=str(row["path"]) if row.get("path") is not None else None,
-                relative_path=str(row["relative_path"]) if row.get("relative_path") is not None else None,
+                relative_path=(
+                    str(row["relative_path"])
+                    if row.get("relative_path") is not None
+                    else None
+                ),
             )
         )
     if not records:
@@ -67,7 +79,12 @@ def labels_from_records(records: Sequence[ImageRecordLite]) -> np.ndarray:
     return np.asarray(labels, dtype=np.int64)
 
 
-def valid_topk_mask(top_indices: np.ndarray, top_values: np.ndarray, vocab_size: int, value_threshold: float = 0.0) -> np.ndarray:
+def valid_topk_mask(
+    top_indices: np.ndarray,
+    top_values: np.ndarray,
+    vocab_size: int,
+    value_threshold: float = 0.0,
+) -> np.ndarray:
     return (
         (top_indices >= 0)
         & (top_indices < int(vocab_size))
@@ -87,7 +104,9 @@ def class_concept_count_matrix(
     labels = np.asarray(labels, dtype=np.int64)
     class_ids = np.asarray(sorted(int(v) for v in np.unique(labels)), dtype=np.int64)
     class_to_row = {int(cls): idx for idx, cls in enumerate(class_ids.tolist())}
-    class_counts = np.bincount(labels, minlength=int(class_ids.max()) + 1)[class_ids].astype(np.int64)
+    class_counts = np.bincount(labels, minlength=int(class_ids.max()) + 1)[
+        class_ids
+    ].astype(np.int64)
     counts = np.zeros((class_ids.shape[0], int(vocab_size)), dtype=np.int64)
     mask = valid_topk_mask(top_indices, top_values, vocab_size, value_threshold)
 
@@ -100,7 +119,12 @@ def class_concept_count_matrix(
     return class_ids, class_counts, counts
 
 
-def select_sparse_topk_rows(rows: np.ndarray, *, k: int, active_threshold: float) -> tuple[np.ndarray, np.ndarray]:
+def select_sparse_topk_rows(
+    rows: np.ndarray,
+    *,
+    k: int,
+    active_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
     if rows.ndim != 2:
         raise ValueError(f"Expected rows shaped [N,K], got {rows.shape}")
     k = min(int(k), int(rows.shape[1]))
@@ -118,7 +142,10 @@ def select_sparse_topk_rows(rows: np.ndarray, *, k: int, active_threshold: float
     return values.astype(rows.dtype, copy=False), indices
 
 
-def tuple_uniqueness_rates(top_indices: np.ndarray, sizes: Sequence[int] = (1, 4, 8)) -> dict[str, float]:
+def tuple_uniqueness_rates(
+    top_indices: np.ndarray,
+    sizes: Sequence[int] = (1, 4, 8),
+) -> dict[str, float]:
     if top_indices.ndim != 2:
         raise ValueError(f"Expected H_top_indices with shape [N,K], got {top_indices.shape}")
     num_rows, top_k = top_indices.shape
@@ -165,7 +192,9 @@ def feature_class_metrics(
         nz = probs > 0
         entropy[concept_id] = float(-(probs[nz] * np.log(probs[nz])).sum())
         if int(active_classes[concept_id]) > 1:
-            normalized_entropy[concept_id] = float(entropy[concept_id] / math.log(int(active_classes[concept_id])))
+            normalized_entropy[concept_id] = float(
+                entropy[concept_id] / math.log(int(active_classes[concept_id]))
+            )
         max_class_share[concept_id] = float(top_class_count[concept_id] / concept_support)
 
     return {
@@ -227,7 +256,14 @@ def select_broad_concepts(
                 "score": score,
             }
         )
-    candidates.sort(key=lambda row: (row["score"], row["normalized_entropy"], row["support"]), reverse=True)
+    candidates.sort(
+        key=lambda row: (
+            row["score"],
+            row["normalized_entropy"],
+            row["support"],
+        ),
+        reverse=True,
+    )
     return candidates[: max(1, int(top_n))]
 
 
@@ -250,7 +286,12 @@ def write_json(path: str | Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
-def top_image_rows_for_concepts(scores: np.ndarray, concept_ids: Sequence[int], *, top_n: int = 16) -> dict[int, list[tuple[int, float]]]:
+def top_image_rows_for_concepts(
+    scores: np.ndarray,
+    concept_ids: Sequence[int],
+    *,
+    top_n: int = 16,
+) -> dict[int, list[tuple[int, float]]]:
     result: dict[int, list[tuple[int, float]]] = {}
     for concept_id in concept_ids:
         cid = int(concept_id)
@@ -276,7 +317,13 @@ def save_preview_image(image_path: str, *, output_path: Path, target_size: int) 
     return preview
 
 
-def crop_patch(preview: Image.Image, *, patch_index: int, patch_grid: tuple[int, int], output_path: Path) -> tuple[int, int]:
+def crop_patch(
+    preview: Image.Image,
+    *,
+    patch_index: int,
+    patch_grid: tuple[int, int],
+    output_path: Path,
+) -> tuple[int, int]:
     grid_h, grid_w = (int(patch_grid[0]), int(patch_grid[1]))
     patch_h = preview.height // grid_h
     patch_w = preview.width // grid_w
@@ -319,7 +366,10 @@ def run_basic_qc(
     labels_path = tokens_dir / "labels.npy"
     if labels_path.exists():
         labels = np.load(labels_path).astype(np.int64, copy=False)
-        records = load_image_records(tokens_dir / "image_ids.jsonl") if (tokens_dir / "image_ids.jsonl").exists() else None
+        if (tokens_dir / "image_ids.jsonl").exists():
+            records = load_image_records(tokens_dir / "image_ids.jsonl")
+        else:
+            records = None
     else:
         records = load_image_records(tokens_dir / "image_ids.jsonl")
         labels = labels_from_records(records)
@@ -354,16 +404,29 @@ def run_basic_qc(
     write_json(concept_dir / "qc_summary.json", qc_summary)
 
     top_preview_concepts = [int(row["concept_id"]) for row in candidates[: int(preview_concepts)]]
-    score_matrix_name = "H_max.npy" if preview_score_mode.lower() == "max" and (concept_dir / "H_max.npy").exists() else "H_mean.npy"
+    score_matrix_name = (
+        "H_max.npy"
+        if preview_score_mode.lower() == "max" and (concept_dir / "H_max.npy").exists()
+        else "H_mean.npy"
+    )
     score_matrix = np.load(concept_dir / score_matrix_name, mmap_mode="r")
-    preview_rows = top_image_rows_for_concepts(score_matrix, top_preview_concepts, top_n=int(preview_images_per_concept))
+    preview_rows = top_image_rows_for_concepts(
+        score_matrix,
+        top_preview_concepts,
+        top_n=int(preview_images_per_concept),
+    )
 
     image_rows_payload = []
     patch_rows_payload = []
     per_image_concepts: dict[int, list[int]] = defaultdict(list)
     for concept_id, ranked_rows in preview_rows.items():
         for rank, (image_row, score) in enumerate(ranked_rows):
-            row = {"concept_id": int(concept_id), "rank": int(rank), "image_row": int(image_row), "score": float(score)}
+            row = {
+                "concept_id": int(concept_id),
+                "rank": int(rank),
+                "image_row": int(image_row),
+                "score": float(score),
+            }
             if records is not None:
                 record = records[image_row]
                 row.update(
@@ -384,20 +447,36 @@ def run_basic_qc(
         model, _ = load_local_sae_checkpoint(checkpoint_path, device=device)
         tokens = np.load(token_info.tokens_path, mmap_mode="r")
         unique_rows = np.asarray(sorted(per_image_concepts), dtype=np.int64)
-        token_batch = torch.from_numpy(np.asarray(tokens[unique_rows], dtype=np.float32)).reshape(-1, int(token_info.d_model))
+        token_batch = torch.from_numpy(
+            np.asarray(tokens[unique_rows], dtype=np.float32)
+        ).reshape(-1, int(token_info.d_model))
         with torch.no_grad():
-            acts = encode_sae(model, token_batch.to(device=device, non_blocking=True)).float().cpu().reshape(
-                unique_rows.shape[0], int(token_info.tokens_per_image), int(model.d_sae)
+            acts = (
+                encode_sae(model, token_batch.to(device=device, non_blocking=True))
+                .float()
+                .cpu()
+                .reshape(
+                    unique_rows.shape[0],
+                    int(token_info.tokens_per_image),
+                    int(model.d_sae),
+                )
             )
 
         preview_png_size = int(token_info.encoder_input_size)
-        concept_to_rank = {(int(row["concept_id"]), int(row["image_row"])): int(row["rank"]) for row in image_rows_payload}
+        concept_to_rank = {
+            (int(row["concept_id"]), int(row["image_row"])): int(row["rank"])
+            for row in image_rows_payload
+        }
         for local_idx, image_row in enumerate(unique_rows.tolist()):
             record = records[int(image_row)]
             preview = None
             if record.path:
                 preview_path = concept_dir / "top_images" / f"image_{int(image_row):06d}.png"
-                preview = save_preview_image(record.path, output_path=preview_path, target_size=preview_png_size)
+                preview = save_preview_image(
+                    record.path,
+                    output_path=preview_path,
+                    target_size=preview_png_size,
+                )
             for concept_id in per_image_concepts[int(image_row)]:
                 column = acts[local_idx, :, int(concept_id)]
                 patch_index = int(column.argmax().item())
@@ -406,7 +485,12 @@ def run_basic_qc(
                 patch_png = None
                 if preview is not None:
                     rank = concept_to_rank[(int(concept_id), int(image_row))]
-                    patch_png = concept_dir / "top_patches" / f"concept_{int(concept_id):05d}" / f"rank_{rank:03d}.png"
+                    patch_png = (
+                        concept_dir
+                        / "top_patches"
+                        / f"concept_{int(concept_id):05d}"
+                        / f"rank_{rank:03d}.png"
+                    )
                     patch_row, patch_col = crop_patch(
                         preview,
                         patch_index=patch_index,
@@ -423,10 +507,16 @@ def run_basic_qc(
                         "patch_col": patch_col,
                         "score": patch_score,
                         "patch_png": None if patch_png is None else str(patch_png),
-                        "image_png": str(concept_dir / "top_images" / f"image_{int(image_row):06d}.png"),
+                        "image_png": str(
+                            concept_dir / "top_images" / f"image_{int(image_row):06d}.png"
+                        ),
                         "path": record.path,
                         "relative_path": record.relative_path,
-                        "class_index": None if record.class_index is None else int(record.class_index),
+                        "class_index": (
+                            None
+                            if record.class_index is None
+                            else int(record.class_index)
+                        ),
                         "class_name": record.class_name,
                     }
                 )
@@ -449,4 +539,3 @@ def run_basic_qc(
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
     return qc_summary
-

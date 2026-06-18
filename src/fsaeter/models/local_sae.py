@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import NamedTuple, Sequence
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -48,7 +49,15 @@ class RunningFeatureStats:
         self.max_l0 = 0
         self.feature_counts = torch.zeros(int(d_sae), dtype=torch.float64)
 
-    def update(self, *, batch_size: int, loss: Tensor, recon_mse: Tensor, aux_loss: Tensor, features: Tensor) -> None:
+    def update(
+        self,
+        *,
+        batch_size: int,
+        loss: Tensor,
+        recon_mse: Tensor,
+        aux_loss: Tensor,
+        features: Tensor,
+    ) -> None:
         batch_size = int(batch_size)
         l0 = (features > 0).sum(dim=1)
         self.total_rows += batch_size
@@ -166,7 +175,11 @@ class LocalSparseAutoencoder(torch.nn.Module):
         if self.variant == "matryoshka_batchtopk" and self.matryoshka_prefixes:
             prefix_losses: list[Tensor] = []
             positive = torch.relu(encoded.h_x)
-            for prefix, weight in zip(self.matryoshka_prefixes, self.matryoshka_weights):
+            for prefix, weight in zip(
+                self.matryoshka_prefixes,
+                self.matryoshka_weights,
+                strict=True,
+            ):
                 prefix = min(int(prefix), self.d_sae)
                 prefix_k = max(1, int(round(self.target_k * (prefix / float(self.d_sae)))))
                 prefix_sparse = self._batch_topk_nonnegative(positive[:, :prefix], prefix_k)
@@ -263,4 +276,3 @@ def payload_to_local_sae_info(payload: dict, checkpoint_path: str | Path) -> Loc
         )
     model = build_local_sae(dict(payload.get("config") or {}))
     return local_sae_info(model, checkpoint_path)
-

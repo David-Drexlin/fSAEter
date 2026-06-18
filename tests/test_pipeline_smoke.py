@@ -24,7 +24,11 @@ def write_cache(tmp_path: Path) -> Path:
     writer.write(patch[2:])
     writer.close()
     metadata = build_token_metadata(
-        config={"encoder": {"name": "dummy", "resolution": 256}, "data": {"image_size": 256}, "tokens": {"save_dtype": "float16"}},
+        config={
+            "encoder": {"name": "dummy", "resolution": 256},
+            "data": {"image_size": 256},
+            "tokens": {"save_dtype": "float16"},
+        },
         encoder=DummyEncoder(),
         num_images=4,
         patch_shape=(4, 8),
@@ -39,7 +43,7 @@ def write_cache(tmp_path: Path) -> Path:
 
 
 def test_cli_smoke_cache_only_pipeline(tmp_path: Path):
-    tokens_dir = write_cache(tmp_path)
+    write_cache(tmp_path)
     train_cfg = tmp_path / "train.yaml"
     train_cfg.write_text(
         """

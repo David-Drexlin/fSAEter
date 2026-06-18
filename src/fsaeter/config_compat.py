@@ -24,7 +24,14 @@ def normalize_extract_config(config: dict) -> dict:
     extraction = dict(cfg.get("extraction") or {})
     storage = dict(cfg.get("storage") or {})
 
-    tokens = _merged(tokens, {k: v for k, v in extraction.items() if k in {"device", "precision", "batch_size", "num_workers"}})
+    tokens = _merged(
+        tokens,
+        {
+            k: v
+            for k, v in extraction.items()
+            if k in {"device", "precision", "batch_size", "num_workers"}
+        },
+    )
     if "save_dtype" not in tokens and "save_dtype" in storage:
         tokens["save_dtype"] = storage["save_dtype"]
 

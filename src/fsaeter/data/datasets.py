@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 import torch
@@ -56,7 +56,9 @@ class PatchTokenMemmapDataset(Dataset[tuple[Tensor, int, int]]):
             base_rows = np.asarray(image_rows, dtype=np.int64)
         if base_rows.ndim != 1:
             raise ValueError(f"image_rows must be 1D, got {base_rows.shape}")
-        if base_rows.size and (int(base_rows.min()) < 0 or int(base_rows.max()) >= self.info.num_images):
+        if base_rows.size and (
+            int(base_rows.min()) < 0 or int(base_rows.max()) >= self.info.num_images
+        ):
             raise IndexError("image_rows contain indices outside the token cache")
 
         self.image_rows = base_rows
@@ -101,4 +103,3 @@ class DatasetPreview:
     val_images: int
     train_rows: int
     val_rows: int
-

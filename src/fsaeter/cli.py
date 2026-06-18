@@ -13,13 +13,28 @@ import torch
 from torch.utils.data import DataLoader
 
 from fsaeter.backbones import LocalBackbone
-from fsaeter.config_compat import normalize_build_h_config, normalize_extract_config, normalize_train_config
+from fsaeter.config_compat import (
+    normalize_build_h_config,
+    normalize_extract_config,
+    normalize_train_config,
+)
 from fsaeter.data.cache import TokenCacheWriter, build_token_metadata, resolve_token_cache_info
-from fsaeter.data.imagefolder import IndexedSubset, build_imagefolder_dataset, make_image_records, summarize_selection, write_jsonl
+from fsaeter.data.imagefolder import (
+    IndexedSubset,
+    build_imagefolder_dataset,
+    make_image_records,
+    summarize_selection,
+    write_jsonl,
+)
 from fsaeter.h.build import run_build_h
 from fsaeter.inspect.basic_qc import run_basic_qc
 from fsaeter.train.runner import run_training
-from fsaeter.utils.config import load_yaml_config, resolve_path, runtime_base_root, save_yaml_config
+from fsaeter.utils.config import (
+    load_yaml_config,
+    resolve_path,
+    runtime_base_root,
+    save_yaml_config,
+)
 from fsaeter.utils.distributed import is_distributed, is_main_process
 
 
@@ -40,7 +55,10 @@ def autocast_context(device: torch.device, precision: str):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fsaeter", description="Local SAE tooling for vision token caches.")
+    parser = argparse.ArgumentParser(
+        prog="fsaeter",
+        description="Local SAE tooling for vision token caches.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_extract = sub.add_parser("extract-tokens", help="Extract patch/global tokens into memmaps.")
@@ -78,7 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--device", default=None)
     p_inspect.add_argument("--dry-run", action="store_true")
 
-    p_mine = sub.add_parser("mine-concepts", help="Mine candidate concepts and previews from a built concept space.")
+    p_mine = sub.add_parser(
+        "mine-concepts",
+        help="Mine candidate concepts and previews from a built concept space.",
+    )
     p_mine.add_argument("--config", required=True)
     p_mine.add_argument("--tokens", default=None)
     p_mine.add_argument("--checkpoint", default=None)
@@ -204,7 +225,11 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
 
     writer = None
     labels = np.empty((len(subset),), dtype=np.int64)
-    records_by_row = make_image_records(dataset, selected_indices, data_root=resolve_path(data_cfg["root"], base=base_root))
+    records_by_row = make_image_records(
+        dataset,
+        selected_indices,
+        data_root=resolve_path(data_cfg["root"], base=base_root),
+    )
 
     offset = 0
     for images, batch_labels, _dataset_indices, _paths in loader:
@@ -212,7 +237,11 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         with autocast_context(device, precision):
             backbone_out = backbone.forward_tokens(images, include_global=include_global)
         patch_tokens = backbone_out.patch_tokens.float()
-        global_tokens = None if backbone_out.global_tokens is None else backbone_out.global_tokens.float()
+        global_tokens = (
+            None
+            if backbone_out.global_tokens is None
+            else backbone_out.global_tokens.float()
+        )
         if normalize_tokens:
             patch_tokens = torch.nn.functional.normalize(patch_tokens, dim=-1)
         if global_tokens is not None and bool(encoder_cfg.get("l2_normalize_global", False)):
@@ -234,7 +263,10 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         raise RuntimeError("No batches were produced by the dataloader.")
     writer.close()
     np.save(tokens_dir / "labels.npy", labels)
-    write_jsonl(tokens_dir / "image_ids.jsonl", (dataclasses.asdict(record) for record in records_by_row))
+    write_jsonl(
+        tokens_dir / "image_ids.jsonl",
+        (dataclasses.asdict(record) for record in records_by_row),
+    )
     class_counts = Counter(int(label) for label in labels.tolist())
     metadata = build_token_metadata(
         config=config,
@@ -263,7 +295,11 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
     checkpoint_path = resolve_path(sae_cfg.get("checkpoint", ""), base=base_root)
     device = get_device(inspect_cfg.get("device", "auto"))
     if dry_run:
-        return {"concept_dir": str(concept_dir), "tokens_dir": str(tokens_dir), "checkpoint": str(checkpoint_path)}
+        return {
+            "concept_dir": str(concept_dir),
+            "tokens_dir": str(tokens_dir),
+            "checkpoint": str(checkpoint_path),
+        }
     qc = run_basic_qc(
         concept_dir=concept_dir,
         tokens_dir=tokens_dir,
@@ -283,7 +319,9 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
 
 def preview_train_command(config: dict, *, base_root: Path) -> dict:
     config = normalize_train_config(config)
-    token_info = resolve_token_cache_info(resolve_path(config["tokens"]["cache_dir"], base=base_root))
+    token_info = resolve_token_cache_info(
+        resolve_path(config["tokens"]["cache_dir"], base=base_root)
+    )
     train_cfg = dict(config.get("train") or {})
     sae_cfg = dict(config.get("sae") or {})
     return {
@@ -301,10 +339,15 @@ def preview_train_command(config: dict, *, base_root: Path) -> dict:
 
 def preview_build_command(config: dict, *, base_root: Path) -> dict:
     config = normalize_build_h_config(config)
-    token_info = resolve_token_cache_info(resolve_path(config["tokens"]["cache_dir"], base=base_root))
+    token_info = resolve_token_cache_info(
+        resolve_path(config["tokens"]["cache_dir"], base=base_root)
+    )
     build_cfg = dict(config.get("build_h") or {})
     max_images_cfg = build_cfg.get("max_images")
-    max_images = int(token_info.num_images) if max_images_cfg in (None, "", 0, "0") else min(int(max_images_cfg), int(token_info.num_images))
+    if max_images_cfg in (None, "", 0, "0"):
+        max_images = int(token_info.num_images)
+    else:
+        max_images = min(int(max_images_cfg), int(token_info.num_images))
     return {
         "tokens_dir": str(resolve_path(config["tokens"]["cache_dir"], base=base_root)),
         "token_shape": [int(token_info.num_images), int(token_info.tokens_per_image), int(token_info.d_model)],
@@ -321,15 +364,29 @@ def main(argv: list[str] | None = None) -> int:
     base_root = runtime_base_root(config_path)
 
     if args.command == "extract-tokens":
-        payload = run_extract_tokens(_apply_extract_overrides(config, args), base_root=base_root, dry_run=bool(args.dry_run))
+        payload = run_extract_tokens(
+            _apply_extract_overrides(config, args),
+            base_root=base_root,
+            dry_run=bool(args.dry_run),
+        )
     elif args.command == "train-sae":
         normalized = _apply_train_overrides(config, args)
-        payload = preview_train_command(normalized, base_root=base_root) if args.dry_run else run_training(normalized, base_root=base_root)
+        if args.dry_run:
+            payload = preview_train_command(normalized, base_root=base_root)
+        else:
+            payload = run_training(normalized, base_root=base_root)
     elif args.command == "build-h":
         normalized = _apply_build_overrides(config, args)
-        payload = preview_build_command(normalized, base_root=base_root) if args.dry_run else run_build_h(normalized, base_root=base_root)
+        if args.dry_run:
+            payload = preview_build_command(normalized, base_root=base_root)
+        else:
+            payload = run_build_h(normalized, base_root=base_root)
     elif args.command in {"inspect", "mine-concepts"}:
-        payload = run_inspect_command(_apply_inspect_overrides(config, args), base_root=base_root, dry_run=bool(args.dry_run))
+        payload = run_inspect_command(
+            _apply_inspect_overrides(config, args),
+            base_root=base_root,
+            dry_run=bool(args.dry_run),
+        )
     else:
         raise ValueError(f"Unknown command {args.command!r}")
 

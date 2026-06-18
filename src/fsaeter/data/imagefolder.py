@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Iterable, Sequence
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
@@ -86,7 +87,11 @@ class ImageRecord:
     class_name: str
 
 
-def build_imagefolder_dataset(config: dict[str, Any], *, base_root: Path) -> tuple[datasets.ImageFolder, list[int]]:
+def build_imagefolder_dataset(
+    config: dict[str, Any],
+    *,
+    base_root: Path,
+) -> tuple[datasets.ImageFolder, list[int]]:
     data_cfg = dict(config.get("data") or {})
     root = resolve_path(data_cfg.get("root", ""), base=base_root)
     split = str(data_cfg.get("split", "train"))
@@ -153,7 +158,10 @@ def write_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def summarize_selection(dataset: datasets.ImageFolder, selected_indices: Sequence[int]) -> dict[str, Any]:
+def summarize_selection(
+    dataset: datasets.ImageFolder,
+    selected_indices: Sequence[int],
+) -> dict[str, Any]:
     counts = Counter(int(dataset.samples[idx][1]) for idx in selected_indices)
     return {
         "num_images": len(selected_indices),
@@ -162,4 +170,3 @@ def summarize_selection(dataset: datasets.ImageFolder, selected_indices: Sequenc
         "max_per_class": max(counts.values()) if counts else 0,
         "class_counts": {str(k): int(v) for k, v in sorted(counts.items())},
     }
-

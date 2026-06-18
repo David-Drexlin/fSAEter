@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from fsaeter.inspect.basic_qc import crop_patch, select_broad_concepts, select_sparse_topk_rows, tuple_uniqueness_rates
+from fsaeter.inspect.basic_qc import (
+    select_broad_concepts,
+    select_sparse_topk_rows,
+    tuple_uniqueness_rates,
+)
 
 
 def test_select_sparse_topk_rows_preserves_invalid_slots():
@@ -14,7 +18,10 @@ def test_select_sparse_topk_rows_preserves_invalid_slots():
 
 
 def test_tuple_uniqueness_rates_report_expected_fingerprint_signal():
-    top_indices = np.asarray([[1, 2, 3, -1], [1, 2, 4, -1], [1, 2, 3, -1], [5, 6, 7, -1]], dtype=np.int32)
+    top_indices = np.asarray(
+        [[1, 2, 3, -1], [1, 2, 4, -1], [1, 2, 3, -1], [5, 6, 7, -1]],
+        dtype=np.int32,
+    )
     rates = tuple_uniqueness_rates(top_indices, sizes=(1, 2, 3))
     assert rates["top_1"] == 0.5
     assert rates["top_2"] == 0.5
@@ -22,12 +29,23 @@ def test_tuple_uniqueness_rates_report_expected_fingerprint_signal():
 
 
 def test_select_broad_concepts_rejects_class_collapsed_feature():
-    top_indices = np.asarray([[0, 2, -1], [0, 2, -1], [0, 3, -1], [1, 2, -1], [1, 3, -1], [1, 3, -1]], dtype=np.int64)
+    top_indices = np.asarray(
+        [[0, 2, -1], [0, 2, -1], [0, 3, -1], [1, 2, -1], [1, 3, -1], [1, 3, -1]],
+        dtype=np.int64,
+    )
     top_values = np.where(top_indices >= 0, 1.0, 0.0).astype(np.float32)
     labels = np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int64)
-    candidates = select_broad_concepts(top_indices, top_values, labels, vocab_size=4, min_support=2, min_class_coverage=2, min_per_class=1, top_n=10)
+    candidates = select_broad_concepts(
+        top_indices,
+        top_values,
+        labels,
+        vocab_size=4,
+        min_support=2,
+        min_class_coverage=2,
+        min_per_class=1,
+        top_n=10,
+    )
     candidate_ids = [row["concept_id"] for row in candidates]
     assert 0 not in candidate_ids
     assert 1 not in candidate_ids
     assert 2 in candidate_ids
-

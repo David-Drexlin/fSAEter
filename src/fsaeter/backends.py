@@ -11,7 +11,9 @@ class TorchDenseBackend:
             return model.loss_dict(x)
         output = model(x)
         if not isinstance(output, dict):
-            raise TypeError(f"Expected dict output from training model, got {type(output).__name__}")
+            raise TypeError(
+                f"Expected dict output from training model, got {type(output).__name__}"
+            )
         return output
 
 

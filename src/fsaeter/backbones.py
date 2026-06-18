@@ -20,7 +20,11 @@ BACKBONE_PRESETS: dict[str, str] = {
 }
 
 
-def add_encoder_factory_to_path(factory_src: str | Path | None = None, *, base_root: Path | None = None) -> Path:
+def add_encoder_factory_to_path(
+    factory_src: str | Path | None = None,
+    *,
+    base_root: Path | None = None,
+) -> Path:
     if factory_src is None:
         env = os.environ.get("FSAETER_ENCODER_FACTORY_SRC")
         if env:
@@ -78,11 +82,11 @@ class LocalBackbone:
         self.num_register_tokens = int(getattr(self._encoder, "num_register_tokens", 0))
         self.encoder_name = encoder_name
 
-    def eval(self) -> "LocalBackbone":
+    def eval(self) -> LocalBackbone:
         self._encoder.eval()
         return self
 
-    def requires_grad_(self, requires_grad: bool) -> "LocalBackbone":
+    def requires_grad_(self, requires_grad: bool) -> LocalBackbone:
         self._encoder.requires_grad_(requires_grad)
         return self
 

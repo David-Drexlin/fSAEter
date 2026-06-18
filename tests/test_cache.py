@@ -26,7 +26,13 @@ def test_stratified_subset_round_robin_balances_classes():
 
 
 def test_token_cache_writer_shapes_and_metadata(tmp_path: Path):
-    writer = TokenCacheWriter(tmp_path, num_images=3, patch_shape=(4, 8), global_shape=(5, 8), save_dtype="float16")
+    writer = TokenCacheWriter(
+        tmp_path,
+        num_images=3,
+        patch_shape=(4, 8),
+        global_shape=(5, 8),
+        save_dtype="float16",
+    )
     writer.write(torch.ones(2, 4, 8), torch.zeros(2, 5, 8))
     writer.write(torch.full((1, 4, 8), 2.0), torch.ones(1, 5, 8))
     writer.close()
@@ -37,7 +43,11 @@ def test_token_cache_writer_shapes_and_metadata(tmp_path: Path):
     assert global_tokens.shape == (3, 5, 8)
 
     metadata = build_token_metadata(
-        config={"encoder": {"name": "dinov2-vit-b[norm]", "resolution": 256}, "data": {"image_size": 256}, "tokens": {"save_dtype": "float16"}},
+        config={
+            "encoder": {"name": "dinov2-vit-b[norm]", "resolution": 256},
+            "data": {"image_size": 256},
+            "tokens": {"save_dtype": "float16"},
+        },
         encoder=DummyEncoder(),
         num_images=3,
         patch_shape=(4, 8),
@@ -48,5 +58,5 @@ def test_token_cache_writer_shapes_and_metadata(tmp_path: Path):
     )
     assert metadata["global_token_order"] == ["cls", "reg_0", "reg_1", "reg_2", "reg_3"]
     (tmp_path / "token_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    assert json.loads((tmp_path / "token_metadata.json").read_text(encoding="utf-8"))["num_images"] == 3
-
+    loaded = json.loads((tmp_path / "token_metadata.json").read_text(encoding="utf-8"))
+    assert loaded["num_images"] == 3

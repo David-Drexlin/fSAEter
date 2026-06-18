@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -54,7 +55,9 @@ def resolve_token_cache_info(tokens_dir: str | Path) -> TokenCacheInfo:
         d_model=int(tokens.shape[2]),
         patch_grid=(int(grid[0]), int(grid[1])),
         patch_size=int(metadata.get("patch_size", 14)),
-        encoder_input_size=int(metadata.get("encoder_input_size", metadata.get("data_image_size", 256))),
+        encoder_input_size=int(
+            metadata.get("encoder_input_size", metadata.get("data_image_size", 256))
+        ),
         data_image_size=int(metadata.get("data_image_size", 256)),
         num_register_tokens=int(metadata.get("num_register_tokens", 0)),
         encoder_name=metadata.get("encoder_name"),
@@ -101,15 +104,25 @@ class TokenCacheWriter:
         if end > self.num_images:
             raise ValueError(f"Token writer overflow: end={end}, num_images={self.num_images}")
         if tuple(patch_tokens.shape[1:]) != self.patch_shape:
-            raise ValueError(f"Patch token shape changed from {self.patch_shape} to {tuple(patch_tokens.shape[1:])}")
+            raise ValueError(
+                f"Patch token shape changed from {self.patch_shape} to "
+                f"{tuple(patch_tokens.shape[1:])}"
+            )
 
-        self.patch_tokens[self.offset : end] = patch_tokens.detach().cpu().numpy().astype(self.dtype, copy=False)
+        self.patch_tokens[self.offset : end] = (
+            patch_tokens.detach().cpu().numpy().astype(self.dtype, copy=False)
+        )
         if self.global_tokens is not None:
             if global_tokens is None:
                 raise ValueError("Writer was initialized for global tokens, but this batch has none.")
             if tuple(global_tokens.shape[1:]) != self.global_shape:
-                raise ValueError(f"Global token shape changed from {self.global_shape} to {tuple(global_tokens.shape[1:])}")
-            self.global_tokens[self.offset : end] = global_tokens.detach().cpu().numpy().astype(self.dtype, copy=False)
+                raise ValueError(
+                    f"Global token shape changed from {self.global_shape} to "
+                    f"{tuple(global_tokens.shape[1:])}"
+                )
+            self.global_tokens[self.offset : end] = (
+                global_tokens.detach().cpu().numpy().astype(self.dtype, copy=False)
+            )
         self.offset = end
 
     def close(self) -> None:
@@ -146,7 +159,11 @@ def build_token_metadata(
     return {
         "encoder_name": encoder_cfg.get("name"),
         "token_shape": [int(num_images), *[int(v) for v in patch_shape]],
-        "global_token_shape": None if global_shape is None else [int(num_images), *[int(v) for v in global_shape]],
+        "global_token_shape": (
+            None
+            if global_shape is None
+            else [int(num_images), *[int(v) for v in global_shape]]
+        ),
         "num_images": int(num_images),
         "num_tokens_per_image": int(patch_tokens_per_image),
         "embedding_dim": int(patch_shape[1]),
@@ -164,4 +181,3 @@ def build_token_metadata(
         "class_counts": {str(k): int(v) for k, v in sorted(class_counts.items())},
         "class_to_idx": dict(sorted(class_to_idx.items(), key=lambda item: item[1])),
     }
-

@@ -12,14 +12,26 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from fsaeter.backends import TorchDenseBackend, TritonSparseBackend
 from fsaeter.config_compat import normalize_train_config
 from fsaeter.data.cache import resolve_token_cache_info
 from fsaeter.data.datasets import PatchTokenMemmapDataset, split_image_rows
 from fsaeter.h.helpers import autocast_context
-from fsaeter.models.local_sae import RunningFeatureStats, build_local_sae, save_local_sae_checkpoint
-from fsaeter.backends import TorchDenseBackend, TritonSparseBackend
+from fsaeter.models.local_sae import (
+    RunningFeatureStats,
+    build_local_sae,
+    save_local_sae_checkpoint,
+)
 from fsaeter.utils.config import resolve_path, save_yaml_config
-from fsaeter.utils.distributed import barrier, cleanup_distributed, init_distributed, is_distributed, is_main_process, local_rank, world_size
+from fsaeter.utils.distributed import (
+    barrier,
+    cleanup_distributed,
+    init_distributed,
+    is_distributed,
+    is_main_process,
+    local_rank,
+    world_size,
+)
 
 
 def get_device(train_cfg: dict) -> torch.device:
@@ -62,7 +74,7 @@ def run_epoch(
 ) -> tuple[dict, np.ndarray]:
     is_train = optimizer is not None
     base_model = _unwrap_model(model)
-    stats = RunningFeatureStats(d_sae=int(getattr(base_model, "d_sae")))
+    stats = RunningFeatureStats(d_sae=int(base_model.d_sae))
     for batch in loader:
         x = batch[0].to(device=device, dtype=torch.float32, non_blocking=True)
         if is_train:
@@ -80,7 +92,10 @@ def run_epoch(
                 if grad_clip_norm is not None and grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm))
                 optimizer.step()
-                if hasattr(base_model, "normalize_decoder_rows_") and getattr(base_model, "decoder_row_norm", False):
+                if (
+                    hasattr(base_model, "normalize_decoder_rows_")
+                    and base_model.decoder_row_norm
+                ):
                     base_model.normalize_decoder_rows_()
         stats.update(
             batch_size=int(x.shape[0]),
@@ -120,7 +135,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
 
     sae_cfg.setdefault("d_model", int(token_info.d_model))
     if int(sae_cfg["d_model"]) != int(token_info.d_model):
-        raise ValueError(f"Config d_model={sae_cfg['d_model']} does not match token dim {token_info.d_model}")
+        raise ValueError(
+            f"Config d_model={sae_cfg['d_model']} does not match token dim "
+            f"{token_info.d_model}"
+        )
     config["sae"] = sae_cfg
 
     train_rows, val_rows = split_image_rows(
@@ -128,8 +146,16 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         val_fraction=float(train_cfg.get("val_fraction", 0.1)),
         seed=int(train_cfg.get("split_seed", run_cfg.get("seed", 0))),
     )
-    train_set = PatchTokenMemmapDataset(tokens_dir, image_rows=train_rows, max_rows=train_cfg.get("max_train_rows"))
-    val_set = PatchTokenMemmapDataset(tokens_dir, image_rows=val_rows, max_rows=train_cfg.get("max_val_rows"))
+    train_set = PatchTokenMemmapDataset(
+        tokens_dir,
+        image_rows=train_rows,
+        max_rows=train_cfg.get("max_train_rows"),
+    )
+    val_set = PatchTokenMemmapDataset(
+        tokens_dir,
+        image_rows=val_rows,
+        max_rows=train_cfg.get("max_val_rows"),
+    )
 
     if is_main_process():
         np.save(out_dir / "train_image_rows.npy", train_rows.astype(np.int64, copy=False))
@@ -143,8 +169,29 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     if grad_clip_norm is not None:
         grad_clip_norm = float(grad_clip_norm)
 
-    train_sampler = DistributedSampler(train_set, num_replicas=world_size(), rank=int(torch.distributed.get_rank()) if is_distributed() and torch.distributed.is_initialized() else 0, shuffle=True) if is_distributed() else None
-    val_sampler = DistributedSampler(val_set, num_replicas=world_size(), rank=int(torch.distributed.get_rank()) if is_distributed() and torch.distributed.is_initialized() else 0, shuffle=False) if is_distributed() and len(val_set) > 0 else None
+    dist_rank = 0
+    if is_distributed() and torch.distributed.is_initialized():
+        dist_rank = int(torch.distributed.get_rank())
+    train_sampler = (
+        DistributedSampler(
+            train_set,
+            num_replicas=world_size(),
+            rank=dist_rank,
+            shuffle=True,
+        )
+        if is_distributed()
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(
+            val_set,
+            num_replicas=world_size(),
+            rank=dist_rank,
+            shuffle=False,
+        )
+        if is_distributed() and len(val_set) > 0
+        else None
+    )
 
     train_loader = DataLoader(
         train_set,
@@ -215,9 +262,12 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 grad_clip_norm=None,
             )
         else:
-            val_metrics = {k: float("nan") for k in ("loss", "recon_mse", "aux_loss", "mean_l0", "dead_fraction")}
+            val_metrics = {
+                k: float("nan")
+                for k in ("loss", "recon_mse", "aux_loss", "mean_l0", "dead_fraction")
+            }
             val_metrics["max_l0"] = 0
-            val_feature_freq = np.zeros((int(getattr(_unwrap_model(model), "d_sae")),), dtype=np.float32)
+            val_feature_freq = np.zeros((int(_unwrap_model(model).d_sae),), dtype=np.float32)
 
         epoch_seconds = float(time.time() - epoch_start)
         record = {
@@ -232,8 +282,14 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         if is_main_process():
             with metrics_jsonl.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
-            np.save(out_dir / "feature_frequency_train_last.npy", train_feature_freq.astype(np.float32, copy=False))
-            np.save(out_dir / "feature_frequency_val_last.npy", val_feature_freq.astype(np.float32, copy=False))
+            np.save(
+                out_dir / "feature_frequency_train_last.npy",
+                train_feature_freq.astype(np.float32, copy=False),
+            )
+            np.save(
+                out_dir / "feature_frequency_val_last.npy",
+                val_feature_freq.astype(np.float32, copy=False),
+            )
 
             checkpoints_dir = out_dir / "checkpoints"
             base_model = _unwrap_model(model)
@@ -246,7 +302,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 best_val_loss=best_val_loss,
                 history=history,
             )
-            current_val = float(val_metrics["loss"]) if not np.isnan(val_metrics["loss"]) else float(train_metrics["loss"])
+            if not np.isnan(val_metrics["loss"]):
+                current_val = float(val_metrics["loss"])
+            else:
+                current_val = float(train_metrics["loss"])
             if best_val_loss is None or current_val < best_val_loss:
                 best_val_loss = current_val
                 best_epoch = epoch

@@ -27,7 +27,10 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     token_info = resolve_token_cache_info(tokens_dir)
     tokens = np.load(token_info.tokens_path, mmap_mode="r")
     max_images_cfg = build_cfg.get("max_images")
-    max_images = int(tokens.shape[0]) if max_images_cfg in (None, "", 0, "0") else min(int(max_images_cfg), int(tokens.shape[0]))
+    if max_images_cfg in (None, "", 0, "0"):
+        max_images = int(tokens.shape[0])
+    else:
+        max_images = min(int(max_images_cfg), int(tokens.shape[0]))
 
     checkpoint_path = resolve_path(sae_cfg.get("checkpoint", ""), base=base_root)
     device_str = str(build_cfg.get("device", "auto")).lower()
@@ -39,7 +42,9 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     model, payload = load_local_sae_checkpoint(checkpoint_path, device=device)
     model_info = payload_to_local_sae_info(payload, checkpoint_path)
     if int(model.d_model) != int(token_info.d_model):
-        raise ValueError(f"Checkpoint d_model={model.d_model} but token dim is {token_info.d_model}")
+        raise ValueError(
+            f"Checkpoint d_model={model.d_model} but token dim is {token_info.d_model}"
+        )
 
     out_dir = resolve_path(run_cfg.get("out_dir", "outputs/local_sae_h"), base=base_root)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -53,12 +58,32 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     token_batch_size = max(1, int(build_cfg.get("token_batch_size", 2048)))
     precision = str(build_cfg.get("precision", "fp32"))
 
-    h_mean = np.lib.format.open_memmap(out_dir / "H_mean.npy", mode="w+", dtype=save_dtype, shape=(int(max_images), int(model.d_sae)))
+    h_mean = np.lib.format.open_memmap(
+        out_dir / "H_mean.npy",
+        mode="w+",
+        dtype=save_dtype,
+        shape=(int(max_images), int(model.d_sae)),
+    )
     h_max = None
     if save_max:
-        h_max = np.lib.format.open_memmap(out_dir / "H_max.npy", mode="w+", dtype=save_dtype, shape=(int(max_images), int(model.d_sae)))
-    top_indices = np.lib.format.open_memmap(out_dir / "H_top_indices.npy", mode="w+", dtype=np.int32, shape=(int(max_images), int(image_top_k)))
-    top_values = np.lib.format.open_memmap(out_dir / "H_top_values.npy", mode="w+", dtype=save_dtype, shape=(int(max_images), int(image_top_k)))
+        h_max = np.lib.format.open_memmap(
+            out_dir / "H_max.npy",
+            mode="w+",
+            dtype=save_dtype,
+            shape=(int(max_images), int(model.d_sae)),
+        )
+    top_indices = np.lib.format.open_memmap(
+        out_dir / "H_top_indices.npy",
+        mode="w+",
+        dtype=np.int32,
+        shape=(int(max_images), int(image_top_k)),
+    )
+    top_values = np.lib.format.open_memmap(
+        out_dir / "H_top_values.npy",
+        mode="w+",
+        dtype=save_dtype,
+        shape=(int(max_images), int(image_top_k)),
+    )
 
     activation_sum = torch.zeros(int(model.d_sae), dtype=torch.float64)
     activation_max = torch.full((int(model.d_sae),), -torch.inf, dtype=torch.float32)
@@ -76,7 +101,11 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             active_threshold=active_threshold,
         )
         mean_np = mean_rows.numpy().astype(save_dtype, copy=False)
-        top_vals_np, top_ids_np = select_sparse_topk_rows(mean_rows.numpy(), k=image_top_k, active_threshold=active_threshold)
+        top_vals_np, top_ids_np = select_sparse_topk_rows(
+            mean_rows.numpy(),
+            k=image_top_k,
+            active_threshold=active_threshold,
+        )
         h_mean[start:end] = mean_np
         top_indices[start:end] = top_ids_np.astype(np.int32, copy=False)
         top_values[start:end] = top_vals_np.astype(save_dtype, copy=False)
@@ -98,7 +127,15 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     image_frequency = (image_active_counts / float(max_images)).numpy().astype(np.float32, copy=False)
     token_frequency = (token_active_counts / total_tokens).numpy().astype(np.float32, copy=False)
     mean_activation = (activation_sum / float(max_images)).numpy().astype(np.float32, copy=False)
-    max_activation = torch.where(torch.isfinite(activation_max), activation_max, torch.zeros_like(activation_max)).numpy().astype(np.float32, copy=False)
+    max_activation = (
+        torch.where(
+            torch.isfinite(activation_max),
+            activation_max,
+            torch.zeros_like(activation_max),
+        )
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
     np.savez_compressed(
         out_dir / "concept_stats.npz",
         mean_activation=mean_activation,
@@ -146,4 +183,3 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
         json.dump(concept_metadata, handle, indent=2, sort_keys=True)
 
     return {"out_dir": str(out_dir), "max_images": int(max_images), "image_top_k": int(image_top_k)}
-

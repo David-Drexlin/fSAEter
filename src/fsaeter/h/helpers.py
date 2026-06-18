@@ -48,11 +48,16 @@ def pool_sae_image_batch(
     if tokens.ndim != 3:
         raise ValueError(f"Expected tokens shaped [images, tokens, dim], got {tokens.shape}")
     num_images, tokens_per_image, d_model = (int(v) for v in tokens.shape)
-    flat = torch.from_numpy(np.asarray(tokens, dtype=np.float32).reshape(num_images * tokens_per_image, d_model))
+    flat = torch.from_numpy(
+        np.asarray(tokens, dtype=np.float32).reshape(
+            num_images * tokens_per_image,
+            d_model,
+        )
+    )
 
-    d_sae = int(getattr(model, "d_sae", 0))
+    d_sae = int(model.d_sae) if hasattr(model, "d_sae") else 0
     if d_sae <= 0 and hasattr(model, "W_enc"):
-        d_sae = int(getattr(model, "W_enc").shape[1])
+        d_sae = int(model.W_enc.shape[1])
     if d_sae <= 0:
         probe = encode_sae(model, flat[:1].to(device)).float()
         d_sae = int(probe.shape[-1])
@@ -72,9 +77,11 @@ def pool_sae_image_batch(
         token_active_counts += (acts > active_threshold).sum(dim=0).float()
         for image_idx in torch.unique(local_images):
             mask = local_images == image_idx
-            maxes[int(image_idx.item())] = torch.maximum(maxes[int(image_idx.item())], acts[mask].max(dim=0).values)
+            maxes[int(image_idx.item())] = torch.maximum(
+                maxes[int(image_idx.item())],
+                acts[mask].max(dim=0).values,
+            )
 
     h_mean = sums / float(tokens_per_image)
     h_max = torch.where(torch.isfinite(maxes), maxes, torch.zeros_like(maxes))
     return h_mean.cpu(), h_max.cpu(), token_active_counts.cpu()
-
