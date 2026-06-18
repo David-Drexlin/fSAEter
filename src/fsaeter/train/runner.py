@@ -15,10 +15,19 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from fsaeter.backends import TorchDenseBackend, TorchSparseBackend, TritonSparseBackend
+from fsaeter.backends import (
+    ShardedBatchTopKBackend,
+    TorchDenseBackend,
+    TorchSparseBackend,
+    TritonSparseBackend,
+)
 from fsaeter.config_compat import normalize_train_config
 from fsaeter.data.cache import resolve_token_cache_info
-from fsaeter.data.datasets import PatchTokenMemmapDataset, split_image_rows
+from fsaeter.data.datasets import (
+    PatchTokenMemmapDataset,
+    PatchTokenShardBatchIterable,
+    split_image_rows,
+)
 from fsaeter.h.helpers import autocast_context
 from fsaeter.models.local_sae import (
     RunningFeatureStats,
@@ -66,6 +75,8 @@ def build_backend(name: str):
         return TorchSparseBackend()
     if normalized == "triton_sparse":
         return TritonSparseBackend()
+    if normalized == "sharded_batchtopk":
+        return ShardedBatchTopKBackend()
     raise ValueError(f"Unknown backend {name!r}")
 
 
@@ -196,6 +207,22 @@ def empty_step_metrics() -> dict:
     }
 
 
+def maybe_loader_diagnostics(loader) -> dict | None:
+    getter = getattr(loader, "last_diagnostics", None)
+    if not callable(getter):
+        return None
+    diagnostics = getter()
+    if diagnostics is None:
+        return None
+    return diagnostics.as_dict()
+
+
+def loader_total_rows(dataset_or_loader) -> int:
+    if hasattr(dataset_or_loader, "max_rows"):
+        return int(getattr(dataset_or_loader, "max_rows"))
+    return int(len(dataset_or_loader))
+
+
 def run_epoch(
     *,
     model: torch.nn.Module,
@@ -208,6 +235,7 @@ def run_epoch(
     scaler,
     grad_clip_norm: float | None,
     global_step: int,
+    reduce_metrics_across_ranks: bool = True,
 ) -> tuple[dict, np.ndarray, int]:
     is_train = optimizer is not None
     base_model = _unwrap_model(model)
@@ -243,6 +271,8 @@ def run_epoch(
                     scaler.unscale_(optimizer)
                 else:
                     loss.backward()
+                if hasattr(backend, "synchronize_gradients"):
+                    backend.synchronize_gradients(model)
                 if base_model.decoder_row_norm:
                     base_model.project_decoder_grad_()
                 if grad_clip_norm is not None and grad_clip_norm > 0:
@@ -267,8 +297,11 @@ def run_epoch(
             features=outputs["features"],
         )
 
-    reduced_summary, feature_frequency = stats.reduced_summary(device=device)
-    return step_metrics_to_dict(reduced_summary), feature_frequency, current_step
+    if reduce_metrics_across_ranks:
+        reduced_summary, feature_frequency = stats.reduced_summary(device=device)
+        return step_metrics_to_dict(reduced_summary), feature_frequency, current_step
+    summary = stats.summary()
+    return step_metrics_to_dict(summary), stats.feature_frequency(), current_step
 
 
 def run_training(config: dict, *, base_root: Path) -> dict:
@@ -302,21 +335,12 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     train_cfg.setdefault("lr_decay", "cosine")
     train_cfg.setdefault("min_lr_fraction", 0.1)
     config["train"] = train_cfg
+    backend = build_backend(train_cfg.get("backend", "torch_sparse"))
 
     train_rows, val_rows = split_image_rows(
         token_info.num_images,
         val_fraction=float(train_cfg.get("val_fraction", 0.1)),
         seed=int(train_cfg.get("split_seed", run_cfg.get("seed", 0))),
-    )
-    train_set = PatchTokenMemmapDataset(
-        tokens_dir,
-        image_rows=train_rows,
-        max_rows=train_cfg.get("max_train_rows"),
-    )
-    val_set = PatchTokenMemmapDataset(
-        tokens_dir,
-        image_rows=val_rows,
-        max_rows=train_cfg.get("max_val_rows"),
     )
 
     if is_main_process():
@@ -338,55 +362,99 @@ def run_training(config: dict, *, base_root: Path) -> dict:
     dist_rank = 0
     if is_distributed() and torch.distributed.is_initialized():
         dist_rank = int(torch.distributed.get_rank())
-    train_sampler = (
-        DistributedSampler(
-            train_set,
-            num_replicas=world_size(),
-            rank=dist_rank,
+    use_shard_loader = str(token_info.storage_format).lower() == "shard_v1"
+    train_sampler = None
+    val_sampler = None
+    loader_cfg = dict(train_cfg.get("loader") or {})
+    replicate_batches = bool(getattr(backend, "requires_replicated_batches", False))
+    if use_shard_loader:
+        train_set = PatchTokenShardBatchIterable(
+            token_info=token_info,
+            image_rows=train_rows,
+            batch_size=batch_size,
+            max_rows=train_cfg.get("max_train_rows"),
+            image_block_size=int(loader_cfg.get("image_block_size", 64)),
+            shuffle_buffer_rows=int(loader_cfg.get("shuffle_buffer_rows", 8192)),
+            seed=seed,
+            rank=0 if replicate_batches else dist_rank,
+            world_size=1 if replicate_batches else world_size(),
+            replicate_across_ranks=replicate_batches,
             shuffle=True,
         )
-        if is_distributed()
-        else None
-    )
-    val_sampler = (
-        DistributedSampler(
-            val_set,
-            num_replicas=world_size(),
-            rank=dist_rank,
+        val_set = PatchTokenShardBatchIterable(
+            token_info=token_info,
+            image_rows=val_rows,
+            batch_size=batch_size,
+            max_rows=train_cfg.get("max_val_rows"),
+            image_block_size=int(loader_cfg.get("image_block_size", 64)),
+            shuffle_buffer_rows=int(loader_cfg.get("shuffle_buffer_rows", 8192)),
+            seed=seed + 1,
+            rank=0 if replicate_batches else dist_rank,
+            world_size=1 if replicate_batches else world_size(),
+            replicate_across_ranks=replicate_batches,
             shuffle=False,
         )
-        if is_distributed() and len(val_set) > 0
-        else None
-    )
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        generator=build_dataloader_generator(seed, rank_offset=dist_rank),
-        worker_init_fn=build_worker_init_fn(seed, rank_offset=dist_rank),
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        generator=build_dataloader_generator(seed + 1, rank_offset=dist_rank),
-        worker_init_fn=build_worker_init_fn(seed + 1, rank_offset=dist_rank),
-    )
+        train_loader = train_set
+        val_loader = val_set
+    else:
+        train_set = PatchTokenMemmapDataset(
+            tokens_dir,
+            image_rows=train_rows,
+            max_rows=train_cfg.get("max_train_rows"),
+        )
+        val_set = PatchTokenMemmapDataset(
+            tokens_dir,
+            image_rows=val_rows,
+            max_rows=train_cfg.get("max_val_rows"),
+        )
+        train_sampler = (
+            DistributedSampler(
+                train_set,
+                num_replicas=world_size(),
+                rank=dist_rank,
+                shuffle=True,
+            )
+            if is_distributed()
+            else None
+        )
+        val_sampler = (
+            DistributedSampler(
+                val_set,
+                num_replicas=world_size(),
+                rank=dist_rank,
+                shuffle=False,
+            )
+            if is_distributed() and len(val_set) > 0
+            else None
+        )
+        train_loader = DataLoader(
+            train_set,
+            batch_size=batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            generator=build_dataloader_generator(seed, rank_offset=dist_rank),
+            worker_init_fn=build_worker_init_fn(seed, rank_offset=dist_rank),
+        )
+        val_loader = DataLoader(
+            val_set,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            generator=build_dataloader_generator(seed + 1, rank_offset=dist_rank),
+            worker_init_fn=build_worker_init_fn(seed + 1, rank_offset=dist_rank),
+        )
 
     model = build_local_sae(config).to(device)
     stats_dir = load_training_stats_into_model(model, config, base_root=base_root)
     if bool(train_cfg.get("compile", False)) and hasattr(torch, "compile") and not is_distributed():
         model = torch.compile(model)  # type: ignore[assignment]
-    if is_distributed():
+    if is_distributed() and not replicate_batches:
         model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
 
     optimizer = build_optimizer(model, train_cfg)
@@ -397,7 +465,6 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         if hasattr(torch.cuda, "amp")
         else None
     )
-    backend = build_backend(train_cfg.get("backend", "torch_sparse"))
     precision = str(train_cfg.get("precision", "fp32"))
 
     history: list[dict] = []
@@ -428,6 +495,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         summary_seed = {
             "seed": int(seed),
             "backend": str(backend.name),
+            "storage_format": str(token_info.storage_format),
             "stats_dir": None if stats_dir is None else str(stats_dir),
             "resume_from": None if not resume_from else str(resolve_path(resume_from, base=base_root)),
             "training_sparsity_mode": "batchtopk_train_style",
@@ -484,6 +552,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 scaler=None,
                 grad_clip_norm=None,
                 global_step=global_step,
+                reduce_metrics_across_ranks=bool(getattr(backend, "reduce_metrics_across_ranks", True)),
             )
         else:
             val_metrics_local = empty_step_metrics()
@@ -503,6 +572,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         train_summary = {
             "out_dir": str(out_dir),
             "backend": str(backend.name),
+            "storage_format": str(token_info.storage_format),
             "epochs": int(epochs),
             "completed_epochs": int(completed_epochs),
             "global_step": int(global_step),
@@ -532,6 +602,12 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 train_sampler.set_epoch(epoch)
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
+            if hasattr(train_loader, "set_epoch"):
+                train_loader.set_epoch(epoch)
+            if hasattr(val_loader, "set_epoch"):
+                val_loader.set_epoch(epoch)
+            if hasattr(backend, "set_epoch"):
+                backend.set_epoch(epoch)
 
             epoch_start = time.time()
             model.train()
@@ -546,6 +622,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 scaler=scaler,
                 grad_clip_norm=grad_clip_norm,
                 global_step=global_step,
+                reduce_metrics_across_ranks=bool(getattr(backend, "reduce_metrics_across_ranks", True)),
             )
             latest_val_metrics, latest_val_feature_freq = evaluate_current_model()
 
@@ -556,9 +633,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 "global_step": int(global_step),
                 "epoch_seconds": epoch_seconds,
                 "lr": current_lr,
-                "train_rows_per_second": float(len(train_set) / max(epoch_seconds, 1e-6)),
+                "train_rows_per_second": float(loader_total_rows(train_set) / max(epoch_seconds, 1e-6)),
                 "train": train_metrics,
                 "val": latest_val_metrics,
+                "loader": maybe_loader_diagnostics(train_loader),
             }
             history.append(record)
             completed_epochs = int(epoch)
@@ -607,6 +685,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         model.train()
         if train_sampler is not None:
             train_sampler.set_epoch(current_epoch)
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(current_epoch)
+        if hasattr(backend, "set_epoch"):
+            backend.set_epoch(current_epoch)
         train_iter = iter(train_loader)
         epoch_stats = RunningFeatureStats(
             d_sae=int(_unwrap_model(model).d_sae),
@@ -619,8 +701,13 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 batch = next(train_iter)
             except StopIteration:
                 if epoch_stats.total_rows > 0:
-                    epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
-                    last_train_metrics = step_metrics_to_dict(epoch_summary)
+                    if bool(getattr(backend, "reduce_metrics_across_ranks", True)):
+                        epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+                        last_train_metrics = step_metrics_to_dict(epoch_summary)
+                    else:
+                        epoch_summary = epoch_stats.summary()
+                        train_feature_freq = epoch_stats.feature_frequency()
+                        last_train_metrics = step_metrics_to_dict(epoch_summary)
                     epoch_seconds = float(time.time() - epoch_start)
                     current_lr = float(optimizer.param_groups[0]["lr"])
                     record = {
@@ -631,6 +718,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                         "train_rows_per_second": float(epoch_stats.total_rows / max(epoch_seconds, 1e-6)),
                         "train": last_train_metrics,
                         "val": latest_val_metrics,
+                        "loader": maybe_loader_diagnostics(train_loader),
                     }
                     history.append(record)
                     completed_epochs = int(current_epoch)
@@ -660,6 +748,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 )
                 if train_sampler is not None:
                     train_sampler.set_epoch(current_epoch)
+                if hasattr(train_loader, "set_epoch"):
+                    train_loader.set_epoch(current_epoch)
+                if hasattr(backend, "set_epoch"):
+                    backend.set_epoch(current_epoch)
                 train_iter = iter(train_loader)
                 continue
 
@@ -684,6 +776,8 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                     scaler.unscale_(optimizer)
                 else:
                     loss.backward()
+                if hasattr(backend, "synchronize_gradients"):
+                    backend.synchronize_gradients(model)
                 if _unwrap_model(model).decoder_row_norm:
                     _unwrap_model(model).project_decoder_grad_()
                 if grad_clip_norm is not None and grad_clip_norm > 0:
@@ -715,7 +809,10 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 or (global_step >= int(max_steps))
             )
             if global_step % log_every_steps == 0:
-                step_summary, _ = epoch_stats.reduced_summary(device=device)
+                if bool(getattr(backend, "reduce_metrics_across_ranks", True)):
+                    step_summary, _ = epoch_stats.reduced_summary(device=device)
+                else:
+                    step_summary = epoch_stats.summary()
                 last_train_metrics = step_metrics_to_dict(step_summary)
                 if is_main_process():
                     write_metrics_record(
@@ -725,11 +822,16 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                             "global_step": int(global_step),
                             "lr": float(optimizer.param_groups[0]["lr"]),
                             "train": last_train_metrics,
+                            "loader": maybe_loader_diagnostics(train_loader),
                         }
                     )
 
             if should_validate:
-                step_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+                if bool(getattr(backend, "reduce_metrics_across_ranks", True)):
+                    step_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+                else:
+                    step_summary = epoch_stats.summary()
+                    train_feature_freq = epoch_stats.feature_frequency()
                 last_train_metrics = step_metrics_to_dict(step_summary)
                 latest_val_metrics, latest_val_feature_freq = evaluate_current_model()
                 if is_main_process():
@@ -741,6 +843,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                             "lr": float(optimizer.param_groups[0]["lr"]),
                             "train": last_train_metrics,
                             "val": latest_val_metrics,
+                            "loader": maybe_loader_diagnostics(train_loader),
                         }
                     )
                     np.save(
@@ -780,7 +883,11 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 barrier()
 
         if epoch_stats.total_rows > 0:
-            epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+            if bool(getattr(backend, "reduce_metrics_across_ranks", True)):
+                epoch_summary, train_feature_freq = epoch_stats.reduced_summary(device=device)
+            else:
+                epoch_summary = epoch_stats.summary()
+                train_feature_freq = epoch_stats.feature_frequency()
             last_train_metrics = step_metrics_to_dict(epoch_summary)
             epoch_seconds = float(time.time() - epoch_start)
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -792,6 +899,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
                 "train_rows_per_second": float(epoch_stats.total_rows / max(epoch_seconds, 1e-6)),
                 "train": last_train_metrics,
                 "val": latest_val_metrics,
+                "loader": maybe_loader_diagnostics(train_loader),
             }
             history.append(record)
             completed_epochs = int(current_epoch)
@@ -819,6 +927,7 @@ def run_training(config: dict, *, base_root: Path) -> dict:
         "completed_epochs": int(completed_epochs),
         "global_step": int(global_step),
         "backend": str(backend.name),
+        "storage_format": str(token_info.storage_format),
         "stats_dir": None if stats_dir is None else str(stats_dir),
         "max_steps": None if max_steps is None else int(max_steps),
     }

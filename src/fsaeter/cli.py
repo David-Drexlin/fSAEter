@@ -18,7 +18,13 @@ from fsaeter.config_compat import (
     normalize_extract_config,
     normalize_train_config,
 )
-from fsaeter.data.cache import TokenCacheWriter, build_token_metadata, resolve_token_cache_info
+from fsaeter.data.cache import (
+    ShardTokenCacheWriter,
+    TokenCacheWriter,
+    build_token_metadata,
+    convert_token_cache,
+    resolve_token_cache_info,
+)
 from fsaeter.data.imagefolder import (
     IndexedSubset,
     build_imagefolder_dataset,
@@ -70,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_extract = sub.add_parser("extract-tokens", help="Extract patch/global tokens into memmaps.")
+    p_extract = sub.add_parser("extract-tokens", help="Extract patch/global tokens into caches.")
     p_extract.add_argument("--config", required=True)
     p_extract.add_argument("--data-root", default=None)
     p_extract.add_argument("--split", default=None)
@@ -78,7 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--batch-size", type=int, default=None)
     p_extract.add_argument("--out", default=None)
     p_extract.add_argument("--max-images", type=int, default=None)
+    p_extract.add_argument("--format", default=None)
+    p_extract.add_argument("--shard-images", type=int, default=None)
     p_extract.add_argument("--dry-run", action="store_true")
+
+    p_convert = sub.add_parser(
+        "convert-token-cache",
+        help="Convert a legacy token cache into the shard_v1 layout.",
+    )
+    p_convert.add_argument("--tokens", required=True)
+    p_convert.add_argument("--out", required=True)
+    p_convert.add_argument("--shard-images", type=int, default=256)
 
     p_train = sub.add_parser("train-sae", help="Train a local SAE on patch-token memmaps.")
     p_train.add_argument("--config", required=True)
@@ -173,6 +189,10 @@ def _apply_extract_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["run"]["out_dir"] = args.out
     if args.max_images is not None:
         config["data"]["subset"]["max_images"] = int(args.max_images)
+    if args.format is not None:
+        config["tokens"]["format"] = str(args.format)
+    if args.shard_images is not None:
+        config["tokens"]["shard_images"] = int(args.shard_images)
     return config
 
 
@@ -305,6 +325,8 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
     include_global = bool(encoder_cfg.get("include_global", True))
     normalize_tokens = bool(encoder_cfg.get("l2_normalize_tokens", True))
     save_dtype = str(token_cfg.get("save_dtype", "float16"))
+    storage_format = str(token_cfg.get("format", "shard_v1")).lower()
+    shard_images = max(1, int(token_cfg.get("shard_images", 256)))
     precision = str(token_cfg.get("precision", "fp32"))
 
     writer = None
@@ -334,13 +356,17 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         if global_tokens is not None and bool(encoder_cfg.get("l2_normalize_global", False)):
             global_tokens = torch.nn.functional.normalize(global_tokens, dim=-1)
         if writer is None:
-            writer = TokenCacheWriter(
-                tokens_dir,
-                num_images=len(subset),
-                patch_shape=patch_tokens.shape[1:],
-                global_shape=None if global_tokens is None else global_tokens.shape[1:],
-                save_dtype=save_dtype,
-            )
+            writer_cls = ShardTokenCacheWriter if storage_format == "shard_v1" else TokenCacheWriter
+            writer_kwargs = {
+                "output_dir": tokens_dir,
+                "num_images": len(subset),
+                "patch_shape": patch_tokens.shape[1:],
+                "global_shape": None if global_tokens is None else global_tokens.shape[1:],
+                "save_dtype": save_dtype,
+            }
+            if writer_cls is ShardTokenCacheWriter:
+                writer_kwargs["shard_images"] = shard_images
+            writer = writer_cls(**writer_kwargs)
         batch_size = int(batch_labels.shape[0])
         writer.write(patch_tokens, global_tokens)
         labels[offset : offset + batch_size] = batch_labels.numpy().astype(np.int64, copy=False)
@@ -364,11 +390,28 @@ def run_extract_tokens(config: dict, *, base_root: Path, dry_run: bool = False) 
         output_dir=tokens_dir,
         class_counts=class_counts,
         class_to_idx=dataset.class_to_idx,
+        storage_format=getattr(writer, "storage_format", storage_format),
+        patch_shards=getattr(writer, "patch_shards", None),
+        global_shards=getattr(writer, "global_shards", None),
+        shard_num_images=getattr(writer, "shard_num_images", None),
     )
     with (tokens_dir / "token_metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
     save_yaml_config(config, tokens_dir / "config_resolved.yaml")
-    return {"selection": summary, "wrote": str(tokens_dir), "metadata": metadata}
+    return {
+        "selection": summary,
+        "wrote": str(tokens_dir),
+        "metadata": metadata,
+        "storage_format": str(metadata.get("storage_format", "legacy_npy")),
+    }
+
+
+def run_convert_token_cache(args: argparse.Namespace) -> dict:
+    return convert_token_cache(
+        args.tokens,
+        args.out,
+        shard_images=int(args.shard_images),
+    )
 
 
 def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False) -> dict:
@@ -410,6 +453,7 @@ def run_inspect_command(config: dict, *, base_root: Path, dry_run: bool = False)
         top_candidate_count=int(inspect_cfg.get("top_candidate_count", 50)),
         miners=inspect_cfg.get("miners", ["localized", "broad"]),
         data_root=data_root,
+        scan_mode=str(inspect_cfg.get("scan_mode", "selected_only")),
     )
     return {"concept_dir": str(concept_dir), "qc": qc}
 
@@ -426,6 +470,7 @@ def preview_train_command(config: dict, *, base_root: Path) -> dict:
         "num_images": int(token_info.num_images),
         "tokens_per_image": int(token_info.tokens_per_image),
         "d_model": int(token_info.d_model),
+        "storage_format": str(token_info.storage_format),
         "variant": str(sae_cfg.get("variant", "batchtopk")),
         "target_k": int(sae_cfg.get("target_k", 0)),
         "d_sae": int(sae_cfg.get("d_sae", 0)),
@@ -492,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
             base_root=base_root,
             dry_run=bool(args.dry_run),
         )
+    elif args.command == "convert-token-cache":
+        payload = run_convert_token_cache(args)
     elif args.command == "train-sae":
         normalized = _apply_train_overrides(config, args)
         if args.dry_run:

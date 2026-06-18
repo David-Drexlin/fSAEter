@@ -3,7 +3,7 @@
 `fSAEter` is a focused codebase for building **vision concept spaces from token caches**:
 
 - extract patch/global token caches from an SSL backbone through a clean loader boundary
-- train local sparse autoencoders over patch-token memmaps
+- train local sparse autoencoders over shard-native or legacy patch-token caches
 - build image-level concept matrices `H_mean`, `H_max`, `H_top_indices`, and `H_top_values`
 - inspect learned features with lightweight statistics, previews, and candidate ranking
 - compute token statistics for normalized SAE training and resumable runs
@@ -19,7 +19,7 @@ It intentionally does **not** include:
 ```text
 images
   -> backbone loader
-  -> token cache (.npy memmaps + metadata)
+  -> token cache (default: `shard_v1`, legacy: `.npy` memmaps)
   -> local SAE training on patch rows
   -> local SAE checkpoint
   -> H builder
@@ -31,6 +31,7 @@ The package ships with:
 - `torch_dense` for dense parity/debugging
 - `torch_sparse` as the default sparse post-TopK training backend
 - `triton_sparse` as an experimental CUDA sparse-decode backend
+- `sharded_batchtopk` as an exact feature-partitioned large-dictionary backend
 - a DDP-ready runner
 - normalized-input training, aux-k dead-feature support, resumeable checkpoints, and build-time inference-mode controls
 - preset-driven backbone loading (`dinov2`, `dinov3`, `siglip2`, `clip`, `uni2`) plus raw factory-string override
@@ -80,6 +81,21 @@ path keeps the existing repository-specific preprocessing contract.
 
 ```bash
 fsaeter extract-tokens --config configs/imagenet100/00_extract_tokens_dinov2b_reg_10k.yaml
+```
+
+New extraction runs default to the shard-native cache layout:
+
+```yaml
+tokens:
+  format: shard_v1
+  shard_images: 256
+```
+
+You can also migrate an older monolithic cache once and keep using the same downstream
+commands:
+
+```bash
+fsaeter convert-token-cache --tokens old_tokens_dir --out shard_tokens_dir
 ```
 
 ### 2. Compute token stats for normalized training
@@ -133,6 +149,7 @@ fsaeter mine-concepts --config configs/imagenet100/11_build_h_local_sae_batchtop
 | `torch_dense` | stable | no | no | parity/debug |
 | `torch_sparse` | default | yes | no | main small/medium runs |
 | `triton_sparse` | experimental | yes | forward sparse decode | CUDA benchmarking and parity checks |
+| `sharded_batchtopk` | exact feature-partitioned | yes | decode path when available | 131k+ dictionaries and multi-GPU feature sharding |
 
 `triton_sparse` currently accelerates the sparse decode path. Dense preactivations and
 dense TopK selection still dominate scaling at large dictionary sizes, so it should be
@@ -141,13 +158,17 @@ described as a decode-path acceleration rather than a fully sharded sparse train
 Other runtime features now in-tree:
 
 - normalized training via `compute-token-stats` + `tokens.stats_dir`
+- shard-native extraction and conversion via `tokens.format: shard_v1` and `convert-token-cache`
 - aux-k dead-feature loss support
 - decoder-gradient projection and decoder row renormalization
 - optimizer/scheduler/scaler/RNG checkpoint resume
 - optional step-based training controls via `train.max_steps`, `train.val_every_steps`,
   `train.checkpoint_every_steps`, and `train.log_every_steps`
+- block/shuffle-buffer shard loading via `train.loader.image_block_size` and `train.loader.shuffle_buffer_rows`
 - `build_h.inference_mode` to separate deterministic per-row inference from legacy BatchTopK evaluation semantics
+- sparse-first `build_h.activation_mode: sparse_stream` for shard caches
 - sparse CSR `H` export via `build_h.save_sparse_csr`
+- selected-feature QC scans via `inspect.scan_mode: selected_only`
 - `compare-runs` for decoder / top-token / top-image stability checks
 
 ## References

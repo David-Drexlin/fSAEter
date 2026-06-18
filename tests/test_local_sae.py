@@ -11,8 +11,14 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 
-from fsaeter.data.cache import TokenCacheWriter, build_token_metadata
-from fsaeter.data.datasets import PatchTokenMemmapDataset
+from fsaeter.data.cache import (
+    TokenCacheWriter,
+    build_token_metadata,
+    convert_token_cache,
+    open_patch_token_reader,
+    resolve_token_cache_info,
+)
+from fsaeter.data.datasets import PatchTokenMemmapDataset, PatchTokenShardBatchIterable
 from fsaeter.models.local_sae import (
     LocalSparseAutoencoder,
     RunningFeatureStats,
@@ -69,6 +75,42 @@ def test_patch_token_memmap_dataset_mapping_is_deterministic(tmp_path: Path):
     assert dataset.global_row_to_image_patch(0) == (2, 0)
     assert dataset.global_row_to_image_patch(5) == (0, 1)
     assert dataset.image_patch_to_global_row(0, 1) == 5
+
+
+def test_convert_token_cache_preserves_patch_tokens(tmp_path: Path):
+    legacy_dir = write_token_cache(tmp_path / "legacy")
+    converted_dir = tmp_path / "converted"
+    payload = convert_token_cache(legacy_dir, converted_dir, shard_images=2)
+    info = resolve_token_cache_info(converted_dir)
+    reader = open_patch_token_reader(info)
+    converted = reader.load_image_slice(0, info.num_images)
+    original = np.load(legacy_dir / "tokens_patch.npy", mmap_mode="r")
+    assert payload["storage_format"] == "shard_v1"
+    assert info.storage_format == "shard_v1"
+    assert converted.shape == original.shape
+    assert np.allclose(converted.astype(np.float32), np.asarray(original, dtype=np.float32))
+
+
+def test_patch_token_shard_batch_iterable_reports_loader_diagnostics(tmp_path: Path):
+    legacy_dir = write_token_cache(tmp_path / "legacy")
+    converted_dir = tmp_path / "converted"
+    convert_token_cache(legacy_dir, converted_dir, shard_images=2)
+    info = resolve_token_cache_info(converted_dir)
+    loader = PatchTokenShardBatchIterable(
+        token_info=info,
+        image_rows=[0, 1, 2],
+        batch_size=3,
+        max_rows=6,
+        image_block_size=2,
+        shuffle_buffer_rows=6,
+        seed=7,
+    )
+    batches = list(loader)
+    diagnostics = loader.last_diagnostics()
+    assert sum(int(batch[0].shape[0]) for batch in batches) == 6
+    assert diagnostics.rows_yielded == 6
+    assert diagnostics.unique_images_seen == 3
+    assert diagnostics.bytes_read > 0
 
 
 def test_batchtopk_keeps_exact_average_budget():

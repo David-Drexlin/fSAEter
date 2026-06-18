@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from fsaeter.data.cache import resolve_token_cache_info
+from fsaeter.data.cache import open_patch_token_reader, resolve_token_cache_info
 from fsaeter.h.helpers import encode_sae, normalize_inference_mode
 from fsaeter.models.local_sae import load_local_sae_checkpoint
 
@@ -586,17 +586,32 @@ def resolve_stored_inference_mode(
     )
 
 
+@torch.no_grad()
+def selected_feature_scores(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    concept_ids: Sequence[int],
+    device: torch.device,
+) -> torch.Tensor:
+    concept_ids_arr = torch.as_tensor(list(concept_ids), device=device, dtype=torch.long)
+    target = model.prepare_target(x.to(device=device, dtype=torch.float32, non_blocking=True))
+    scores = target.matmul(model.W_enc[:, concept_ids_arr]) + model.b_enc[concept_ids_arr]
+    return torch.relu(scores)
+
+
 def scan_feature_top_tokens(
     *,
     concept_ids: Sequence[int],
     source_rows: np.ndarray,
-    tokens: np.ndarray,
+    token_reader,
     token_info,
     checkpoint_path: str | Path,
     device: torch.device,
     precision: str,
     top_n: int,
     inference_mode: str,
+    scan_mode: str = "selected_only",
 ) -> dict[str, np.ndarray]:
     concept_ids_arr = np.asarray(sorted({int(v) for v in concept_ids}), dtype=np.int64)
     concept_ids_list = [int(v) for v in concept_ids_arr.tolist()]
@@ -613,30 +628,49 @@ def scan_feature_top_tokens(
     top_rows = np.full((concept_ids_arr.shape[0], int(top_n)), -1, dtype=np.int64)
     top_patches = np.full((concept_ids_arr.shape[0], int(top_n)), -1, dtype=np.int32)
     image_batch_size = max(1, int(max(1, 2048 // max(1, token_info.tokens_per_image))))
+    normalized_scan_mode = str(scan_mode).lower()
 
     for start in range(0, int(source_rows.shape[0]), image_batch_size):
         end = min(start + image_batch_size, int(source_rows.shape[0]))
         current_rows = source_rows[start:end]
-        token_batch = torch.from_numpy(np.asarray(tokens[current_rows], dtype=np.float32)).reshape(
+        token_batch = torch.from_numpy(token_reader.load_image_rows(current_rows).astype(np.float32, copy=False)).reshape(
             -1,
             int(token_info.d_model),
         )
         with torch.no_grad():
-            acts = (
-                encode_sae(
-                    model,
-                    token_batch.to(device=device, non_blocking=True),
-                    inference_mode=inference_mode,
+            if normalized_scan_mode == "selected_only":
+                selected = (
+                    selected_feature_scores(
+                        model,
+                        token_batch,
+                        concept_ids=concept_ids_list,
+                        device=device,
+                    )
+                    .float()
+                    .cpu()
+                    .reshape(
+                        current_rows.shape[0],
+                        int(token_info.tokens_per_image),
+                        len(concept_ids_list),
+                    )
+                    .numpy()
                 )
-                .float()
-                .cpu()
-                .reshape(
-                    current_rows.shape[0],
-                    int(token_info.tokens_per_image),
-                    int(model.d_sae),
+            else:
+                acts = (
+                    encode_sae(
+                        model,
+                        token_batch.to(device=device, non_blocking=True),
+                        inference_mode=inference_mode,
+                    )
+                    .float()
+                    .cpu()
+                    .reshape(
+                        current_rows.shape[0],
+                        int(token_info.tokens_per_image),
+                        int(model.d_sae),
+                    )
                 )
-            )
-        selected = acts[:, :, concept_ids_list].numpy()
+                selected = acts[:, :, concept_ids_list].numpy()
         for local_idx, concept_id in enumerate(concept_ids_list):
             concept_scores = selected[:, :, local_idx].reshape(-1)
             image_offsets = np.repeat(np.arange(current_rows.shape[0]), int(token_info.tokens_per_image))
@@ -684,11 +718,13 @@ def run_basic_qc(
     top_candidate_count: int = 50,
     miners: Sequence[str] = ("localized", "broad"),
     data_root: str | Path | None = None,
+    scan_mode: str = "selected_only",
 ) -> dict:
     concept_dir = Path(concept_dir).expanduser().resolve()
     tokens_dir = Path(tokens_dir).expanduser().resolve()
     resolved_data_root = None if data_root is None else Path(data_root).expanduser().resolve()
     token_info = resolve_token_cache_info(tokens_dir)
+    token_reader = open_patch_token_reader(token_info)
 
     concept_metadata = load_concept_metadata(concept_dir)
     build_summary = load_build_summary(concept_dir)
@@ -804,6 +840,7 @@ def run_basic_qc(
         "active_threshold": float(active_threshold),
         "candidate_score_mode": str(candidate_score_mode).lower(),
         "inference_mode": inference_mode,
+        "scan_mode": str(scan_mode).lower(),
         "miners": normalized_miners,
         "token_frequency_mean": float(np.asarray(token_frequency, dtype=np.float64).mean()),
         "train_summary": train_summary,
@@ -871,10 +908,9 @@ def run_basic_qc(
 
     if local_records is not None and per_source_image_concepts:
         model, _ = load_local_sae_checkpoint(checkpoint_path, device=device)
-        tokens = np.load(token_info.tokens_path, mmap_mode="r")
         unique_rows = np.asarray(sorted(per_source_image_concepts), dtype=np.int64)
         token_batch = torch.from_numpy(
-            np.asarray(tokens[unique_rows], dtype=np.float32)
+            token_reader.load_image_rows(unique_rows).astype(np.float32, copy=False)
         ).reshape(-1, int(token_info.d_model))
         with torch.no_grad():
             acts = (
@@ -964,13 +1000,14 @@ def run_basic_qc(
     feature_scan = scan_feature_top_tokens(
         concept_ids=[row["concept_id"] for row in flattened_candidates if "concept_id" in row],
         source_rows=h_rows,
-        tokens=np.load(token_info.tokens_path, mmap_mode="r"),
+        token_reader=token_reader,
         token_info=token_info,
         checkpoint_path=checkpoint_path,
         device=device,
         precision=precision,
         top_n=max(1, int(preview_images_per_concept)),
         inference_mode=inference_mode,
+        scan_mode=scan_mode,
     )
     np.savez_compressed(concept_dir / "feature_top_tokens.npz", **feature_scan)
 

@@ -9,8 +9,12 @@ import numpy as np
 import torch
 
 from fsaeter.config_compat import normalize_build_h_config
-from fsaeter.data.cache import resolve_token_cache_info
-from fsaeter.h.helpers import normalize_inference_mode, pool_sae_image_batch
+from fsaeter.data.cache import open_patch_token_reader, resolve_token_cache_info
+from fsaeter.h.helpers import (
+    normalize_inference_mode,
+    pool_sae_image_batch,
+    pool_sae_image_batch_sparse,
+)
 from fsaeter.inspect.basic_qc import select_sparse_topk_rows
 from fsaeter.models.local_sae import load_local_sae_checkpoint, payload_to_local_sae_info
 from fsaeter.utils.config import resolve_path, save_yaml_config
@@ -57,12 +61,12 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
 
     tokens_dir = resolve_path(tokens_cfg.get("cache_dir", ""), base=base_root)
     token_info = resolve_token_cache_info(tokens_dir)
-    tokens = np.load(token_info.tokens_path, mmap_mode="r")
+    token_reader = open_patch_token_reader(token_info)
     max_images_cfg = build_cfg.get("max_images")
     if max_images_cfg in (None, "", 0, "0"):
-        max_images = int(tokens.shape[0])
+        max_images = int(token_info.num_images)
     else:
-        max_images = min(int(max_images_cfg), int(tokens.shape[0]))
+        max_images = min(int(max_images_cfg), int(token_info.num_images))
 
     checkpoint_path = resolve_path(sae_cfg.get("checkpoint", ""), base=base_root)
     device_str = str(build_cfg.get("device", "auto")).lower()
@@ -92,6 +96,12 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
     if save_sparse_csr_requested:
         save_topk_mean = True
         save_topk_max = True
+    activation_mode = str(
+        build_cfg.get(
+            "activation_mode",
+            "sparse_stream" if str(token_info.storage_format).lower() == "shard_v1" else "dense_pool",
+        )
+    ).lower()
     inference_mode = normalize_inference_mode(
         build_cfg.get("inference_mode"),
         default="per_row_topk",
@@ -171,30 +181,51 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
 
     for start in range(0, int(max_images), image_batch_size):
         end = min(start + image_batch_size, int(max_images))
-        mean_rows, max_rows, active_tokens = pool_sae_image_batch(
-            model,
-            tokens[start:end],
-            device=device,
-            token_batch_size=token_batch_size,
-            precision=precision,
-            active_threshold=active_threshold,
-            inference_mode=inference_mode,
-        )
-        if dense_mean is not None:
-            dense_mean[start:end] = mean_rows.numpy().astype(save_dtype, copy=False)
-        if dense_max is not None:
-            dense_max[start:end] = max_rows.numpy().astype(save_dtype, copy=False)
+        token_block = token_reader.load_image_slice(start, end)
+        if activation_mode == "sparse_stream":
+            mean_rows, max_rows, mean_vals_np, mean_ids_np, max_vals_np, max_ids_np, active_tokens = (
+                pool_sae_image_batch_sparse(
+                    model,
+                    token_block,
+                    device=device,
+                    token_batch_size=token_batch_size,
+                    precision=precision,
+                    active_threshold=active_threshold,
+                    inference_mode=inference_mode,
+                    image_top_k=image_top_k,
+                    return_dense_mean=True,
+                    return_dense_max=True,
+                )
+            )
+            if dense_mean is not None and mean_rows is not None:
+                dense_mean[start:end] = mean_rows.numpy().astype(save_dtype, copy=False)
+            if dense_max is not None and max_rows is not None:
+                dense_max[start:end] = max_rows.numpy().astype(save_dtype, copy=False)
+        else:
+            mean_rows, max_rows, active_tokens = pool_sae_image_batch(
+                model,
+                token_block,
+                device=device,
+                token_batch_size=token_batch_size,
+                precision=precision,
+                active_threshold=active_threshold,
+                inference_mode=inference_mode,
+            )
+            if dense_mean is not None:
+                dense_mean[start:end] = mean_rows.numpy().astype(save_dtype, copy=False)
+            if dense_max is not None:
+                dense_max[start:end] = max_rows.numpy().astype(save_dtype, copy=False)
 
-        mean_vals_np, mean_ids_np = select_sparse_topk_rows(
-            mean_rows.numpy(),
-            k=image_top_k,
-            active_threshold=active_threshold,
-        )
-        max_vals_np, max_ids_np = select_sparse_topk_rows(
-            max_rows.numpy(),
-            k=image_top_k,
-            active_threshold=active_threshold,
-        )
+            mean_vals_np, mean_ids_np = select_sparse_topk_rows(
+                mean_rows.numpy(),
+                k=image_top_k,
+                active_threshold=active_threshold,
+            )
+            max_vals_np, max_ids_np = select_sparse_topk_rows(
+                max_rows.numpy(),
+                k=image_top_k,
+                active_threshold=active_threshold,
+            )
         if mean_top_indices is not None and mean_top_values is not None:
             mean_top_indices[start:end] = mean_ids_np.astype(np.int32, copy=False)
             mean_top_values[start:end] = mean_vals_np.astype(save_dtype, copy=False)
@@ -207,6 +238,8 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
         compat_top_indices[start:end] = compat_ids.astype(np.int32, copy=False)
         compat_top_values[start:end] = compat_vals.astype(save_dtype, copy=False)
 
+        assert mean_rows is not None
+        assert max_rows is not None
         activation_sum += mean_rows.double().sum(dim=0)
         activation_max = torch.maximum(activation_max, max_rows.max(dim=0).values)
         image_active_counts_mean += (mean_rows > active_threshold).double().sum(dim=0)
@@ -277,6 +310,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
 
     build_summary = {
         "out_dir": str(out_dir),
+        "storage_format": token_info.storage_format,
         "max_images": int(max_images),
         "image_top_k": int(image_top_k),
         "inference_mode": inference_mode,
@@ -286,6 +320,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
         "save_topk_max": bool(save_topk_max),
         "save_sparse_csr_requested": bool(save_sparse_csr_requested),
         "save_sparse_csr_written": bool(csr_paths_mean is not None and csr_paths_max is not None),
+        "activation_mode": activation_mode,
         "active_threshold": float(active_threshold),
         "H_mean_csr": csr_paths_mean,
         "H_max_csr": csr_paths_max,
@@ -316,6 +351,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             "tokens": token_info.tokens_path,
             "metadata": token_info.metadata_path,
             "labels": token_info.labels_path,
+            "storage_format": token_info.storage_format,
             "encoder_name": token_info.encoder_name,
             "encoder_model": token_info.encoder_model,
             "encoder_factory_string": token_info.encoder_factory_string,
@@ -349,6 +385,7 @@ def run_build_h(config: dict, *, base_root: Path) -> dict:
             "image_top_k": int(image_top_k),
             "active_threshold": float(active_threshold),
             "inference_mode": inference_mode,
+            "activation_mode": activation_mode,
             "sparse_topk": True,
             "save_dtype": str(save_dtype),
             "save_sparse_csr_requested": bool(save_sparse_csr_requested),

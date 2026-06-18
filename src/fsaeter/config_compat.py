@@ -124,6 +124,7 @@ def normalize_build_h_config(config: dict) -> dict:
         "token_batch_size",
         "max_images",
         "inference_mode",
+        "activation_mode",
     ):
         if key in inference and key not in build_h:
             build_h[key] = inference[key]
@@ -143,6 +144,8 @@ def normalize_build_h_config(config: dict) -> dict:
     for key, value in qc.items():
         if key not in inspect:
             inspect[key] = value
+    if "scan_mode" in qc and "scan_mode" not in inspect:
+        inspect["scan_mode"] = qc["scan_mode"]
 
     return {
         "run": run,

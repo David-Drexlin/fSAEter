@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from fsaeter.config_compat import normalize_train_config
-from fsaeter.data.cache import resolve_token_cache_info
+from fsaeter.data.cache import open_patch_token_reader, resolve_token_cache_info
 from fsaeter.utils.config import resolve_path, save_yaml_config
 from fsaeter.utils.repro import resolve_run_seed, seed_everything
 
@@ -21,7 +21,7 @@ def compute_token_stats(config: dict, *, base_root: Path) -> dict:
 
     tokens_dir = resolve_path(tokens_cfg.get("cache_dir", ""), base=base_root)
     token_info = resolve_token_cache_info(tokens_dir)
-    tokens = np.load(token_info.tokens_path, mmap_mode="r")
+    token_reader = open_patch_token_reader(token_info)
     stats_dir = resolve_path(
         tokens_cfg.get("stats_dir", run_cfg.get("out_dir", "outputs/token_stats")),
         base=base_root,
@@ -35,7 +35,10 @@ def compute_token_stats(config: dict, *, base_root: Path) -> dict:
 
     for start in range(0, int(token_info.num_images), image_batch_size):
         end = min(start + image_batch_size, int(token_info.num_images))
-        flat = np.asarray(tokens[start:end], dtype=np.float32).reshape(-1, int(token_info.d_model))
+        flat = token_reader.load_image_slice(start, end).astype(np.float32, copy=False).reshape(
+            -1,
+            int(token_info.d_model),
+        )
         sum_x += flat.sum(axis=0, dtype=np.float64)
         sum_x2 += np.square(flat.astype(np.float64, copy=False)).sum(axis=0, dtype=np.float64)
 

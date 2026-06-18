@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 
 from fsaeter.cli import main
+from fsaeter.data.cache import open_patch_token_reader, resolve_token_cache_info
 
 
 def _write_tiny_imagefolder(root: Path) -> None:
@@ -105,11 +106,13 @@ tokens:
         os.chdir(cwd)
 
     tokens_dir = tmp_path / "out" / "tokens"
-    patch_tokens = np.load(tokens_dir / "tokens_patch.npy")
-    global_tokens = np.load(tokens_dir / "tokens_global.npy")
     metadata = json.loads((tokens_dir / "token_metadata.json").read_text(encoding="utf-8"))
+    token_info = resolve_token_cache_info(tokens_dir)
+    patch_tokens = open_patch_token_reader(token_info).load_image_slice(0, token_info.num_images)
+    global_tokens = np.load(tokens_dir / metadata["global_shards"][0])
+    assert metadata["storage_format"] == "shard_v1"
     assert patch_tokens.shape == (4, 4, 8)
-    assert global_tokens.shape == (4, 2, 8)
+    assert global_tokens.shape[1:] == (2, 8)
     assert metadata["encoder_model"] == "hf:facebook/dinov2-base"
     assert metadata["encoder_name"] == "facebook/dinov2-base"
     assert metadata["num_register_tokens"] == 1
